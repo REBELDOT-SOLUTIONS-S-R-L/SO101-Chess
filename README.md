@@ -198,8 +198,10 @@ directly instead.
 
 The chess task randomizes the scene at every reset:
 
-- The three scene lights share a sampled intensity multiplier from 0.2 to 2.0 and a color temperature from 2500 K to 9000 K. The imported ground plane's much brighter sphere light is disabled so these changes affect camera images. Sampled values are printed as `[CHESS DR]` and stored in `env.unwrapped.chess_randomization_state`.
-- The table, black robot and black or white pieces vary in shade and surface finish. Textured finishes use Isaac Sim's material-library textures under `Isaac/Samples/DR/Materials/Textures/`, resolved through the configured Isaac asset root.
+- The three scene lights share a sampled intensity multiplier from 0.4 to 2.0 and a color temperature from 2500 K to 7000 K. The imported ground plane's much brighter sphere light is disabled so these changes affect camera images. Sampled values are printed as `[CHESS DR]` and stored in `env.unwrapped.chess_randomization_state`.
+- The table stays in white shades (0.88–0.97) with a subtle painted MDF-like grain made from one Isaac Sim library texture, `textured_wall.png`. Only its grain contrast and roughness vary slightly.
+- The pieces stay white or black and use Isaac Sim's `OmniSurface_Plastic` material family. Their shade and matte plastic roughness vary narrowly to model 3D-printed pieces.
+- The robot uses a matte plastic finish based on the supplied blue-black filament hue `#080A0D`. Its shader reflectance is lifted slightly to retain visible detail under dim randomized lights, with a narrow brightness variation.
 - Chessboard squares vary only between shades of white and dark gray. Their texture and the yellow border material are left alone. Source and destination markers remain red and green.
 - Each episode contains 1–6 pieces by default. Other pieces are placed on separate squares away from the source, destination and move path; unused rigid bodies are parked off the board.
 

@@ -21,20 +21,22 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-# Textures shipped in the Isaac Sim asset library. The asset root can be a
-# local asset pack or a Nucleus URL, depending on the user's Isaac setup.
-_LIBRARY_TEXTURES = {
-    "marble": "marble_tile.png",
-    "wall": "textured_wall.png",
-}
-_FINISHES = ("smooth", "marble", "wall")
+# A single, low-contrast Isaac Sim library texture gives the white table a
+# painted MDF-like grain. Its contrast is compressed in _preview_material.
+_TABLE_TEXTURE = "textured_wall.png"
+# USD Preview Surface fallback for the Isaac material-library plastic preset.
+_PLASTIC_MDL = "OmniSurfacePresets.mdl"
+_PLASTIC_PRESET = "OmniSurface_Plastic"
+# Filament color supplied for the printed SO-101 robot. Keep the same hue in
+# shader inputs so the rendered object remains readable under task lighting.
+_ROBOT_FILAMENT_COLOR = (8 / 255, 10 / 255, 13 / 255)
 
 
-def _texture_url(finish: str) -> str:
+def _texture_url() -> str:
     from isaacsim.storage.native import get_assets_root_path
 
     root = get_assets_root_path(skip_check=True).rstrip("/")
-    return f"{root}/Isaac/Samples/DR/Materials/Textures/{_LIBRARY_TEXTURES[finish]}"
+    return f"{root}/Isaac/Samples/DR/Materials/Textures/{_TABLE_TEXTURE}"
 
 
 _LIGHT_NAMES = ("TopLight", "FrontLight", "RightLight")
@@ -48,27 +50,36 @@ def _uniform(low: float, high: float) -> float:
     return low + (high - low) * float(torch.rand(()).item())
 
 
-def _preview_material(stage: Usd.Stage, path: str, color: tuple[float, float, float], finish: str):
-    """Create or update a USD Preview Surface with a plain or mapped finish."""
-    if finish not in _FINISHES:
-        raise ValueError(f"Unknown visual finish: {finish}")
+def _preview_material(
+    stage: Usd.Stage,
+    path: str,
+    color: tuple[float, float, float],
+    roughness: float,
+    texture_strength: float = 0.0,
+):
+    """Create a matte preview material, optionally with subtle library grain."""
     material = UsdShade.Material.Define(stage, path)
     shader = UsdShade.Shader.Define(stage, f"{path}/Shader")
     shader.CreateIdAttr("UsdPreviewSurface")
-    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(
-        {"smooth": 0.5, "marble": 0.45, "wall": 0.75}[finish]
-    )
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(roughness)
     shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
     diffuse = shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f)
-    if finish == "smooth":
+    if texture_strength == 0.0:
         diffuse.DisconnectSource()
         diffuse.Set(Gf.Vec3f(*color))
     else:
         texture = UsdShade.Shader.Define(stage, f"{path}/Texture")
         texture.CreateIdAttr("UsdUVTexture")
-        texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(_texture_url(finish)))
+        texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(_texture_url()))
         texture.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
-        texture.CreateInput("scale", Sdf.ValueTypeNames.Float4).Set(Gf.Vec4f(*color, 1.0))
+        # The library image itself is mid-gray. Blend only a small amount of
+        # its variation into the chosen white base so the table stays white.
+        texture.CreateInput("scale", Sdf.ValueTypeNames.Float4).Set(
+            Gf.Vec4f(texture_strength, texture_strength, texture_strength, 1.0)
+        )
+        texture.CreateInput("bias", Sdf.ValueTypeNames.Float4).Set(
+            Gf.Vec4f(*(c - 0.7 * texture_strength for c in color), 0.0)
+        )
         uv = UsdShade.Shader.Define(stage, f"{path}/UV")
         uv.CreateIdAttr("UsdPrimvarReader_float2")
         uv.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
@@ -78,6 +89,22 @@ def _preview_material(stage: Usd.Stage, path: str, color: tuple[float, float, fl
         diffuse.ConnectToSource(texture.ConnectableAPI(), "rgb")
     shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
     material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    return material
+
+
+def _plastic_material(stage: Usd.Stage, path: str, color: tuple[float, float, float], roughness: float):
+    """Use Isaac Sim's plastic material preset with restrained printed finish."""
+    material = _preview_material(stage, path, color, roughness)
+    shader = UsdShade.Shader.Define(stage, f"{path}/PlasticShader")
+    shader.SetSourceAsset(Sdf.AssetPath(_PLASTIC_MDL), "mdl")
+    shader.SetSourceAssetSubIdentifier(_PLASTIC_PRESET, "mdl")
+    shader.CreateInput("diffuse_reflection_color", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
+    shader.CreateInput("subsurface_transmission_color", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
+    shader.CreateInput("enable_diffuse_transmission", Sdf.ValueTypeNames.Bool).Set(False)
+    shader.CreateInput("subsurface_weight", Sdf.ValueTypeNames.Float).Set(0.0)
+    shader.CreateInput("specular_reflection_roughness", Sdf.ValueTypeNames.Float).Set(roughness)
+    shader.CreateOutput("out", Sdf.ValueTypeNames.Token)
+    material.CreateSurfaceOutput("mdl").ConnectToSource(shader.ConnectableAPI(), "out")
     return material
 
 
@@ -110,7 +137,7 @@ def _ensure_cube_uv(prim) -> None:
     )
 
 
-def _bind_visible_geometry(stage: Usd.Stage, root_path: str, material, finish: str) -> None:
+def _bind_visible_geometry(stage: Usd.Stage, root_path: str, material, textured: bool = False) -> None:
     root = stage.GetPrimAtPath(root_path)
     if not root.IsValid():
         raise RuntimeError(f"Appearance target is missing: {root_path}")
@@ -120,9 +147,9 @@ def _bind_visible_geometry(stage: Usd.Stage, root_path: str, material, finish: s
     found = False
     for prim in Usd.PrimRange(root):
         if prim.IsA(UsdGeom.Gprim) and UsdGeom.Imageable(prim).ComputeVisibility() != "invisible":
-            if finish != "smooth" and prim.IsA(UsdGeom.Mesh):
+            if textured and prim.IsA(UsdGeom.Mesh):
                 _ensure_mesh_uv(UsdGeom.Mesh(prim))
-            elif finish != "smooth" and prim.IsA(UsdGeom.Cube):
+            elif textured and prim.IsA(UsdGeom.Cube):
                 _ensure_cube_uv(prim)
             UsdShade.MaterialBindingAPI(prim).Bind(material, bindingStrength="strongerThanDescendants")
             found = True
@@ -133,10 +160,6 @@ def _bind_visible_geometry(stage: Usd.Stage, root_path: str, material, finish: s
 def _piece_root(env, name: str, env_id: int) -> str:
     """Use the actual spawned prim path, including the white pieces' short names."""
     return str(env.scene[name].root_physx_view.prim_paths[env_id])
-
-
-def _random_finish() -> str:
-    return _FINISHES[int(torch.randint(len(_FINISHES), (1,)).item())]
 
 
 def randomize_chess_appearance(
@@ -150,7 +173,7 @@ def randomize_chess_appearance(
     All three lights share one sampled temperature and intensity multiplier
     so the effect remains visible in a camera image. The red source and green
     target markers and yellow board border keep their authored materials.
-    Piece colors stay on their named side while varying shade and finish.
+    Piece colors stay on their named side with one printed-plastic family.
     """
     if light_intensity_range[0] <= 0 or light_intensity_range[0] > light_intensity_range[1]:
         raise ValueError("light_intensity_range must be positive and increasing")
@@ -212,22 +235,28 @@ def randomize_chess_appearance(
             f"temperature_k={temperature:.0f}"
         )
 
-        table_shade = _uniform(0.78, 1.0)
-        table_finish = _random_finish()
-        table = _preview_material(stage, f"{looks}/Table", (table_shade,) * 3, table_finish)
-        _bind_visible_geometry(stage, f"{scene_path}/TableBase", table, table_finish)
+        # Painted white MDF: one library texture family, with only slight
+        # changes in shade, grain contrast and roughness between episodes.
+        table_shade = _uniform(0.88, 0.97)
+        table_grain = _uniform(0.025, 0.065)
+        table = _preview_material(
+            stage, f"{looks}/Table", (table_shade,) * 3,
+            roughness=_uniform(0.65, 0.78), texture_strength=table_grain,
+        )
+        _bind_visible_geometry(stage, f"{scene_path}/TableBase", table, textured=True)
 
-        robot_shade = _uniform(0.025, 0.13)
-        robot_color = (robot_shade,) * 3
-        robot_finish = _random_finish()
-        robot = _preview_material(stage, f"{looks}/Robot", robot_color, robot_finish)
-        _bind_visible_geometry(stage, f"{scene_path}/arm", robot, robot_finish)
+        # Match the filament hue with a matte plastic finish. Lift the shader
+        # reflectance so its printed details remain visible under dim lighting.
+        robot_scale = _uniform(2.0, 2.4)
+        robot_color = tuple(channel * robot_scale for channel in _ROBOT_FILAMENT_COLOR)
+        robot = _plastic_material(stage, f"{looks}/Robot", robot_color, roughness=_uniform(0.78, 0.85))
+        _bind_visible_geometry(stage, f"{scene_path}/arm", robot)
 
         board = f"{scene_path}/ChessBoard"
         white = _uniform(0.78, 1.0)
         dark_gray = _uniform(0.12, 0.30)
-        white_mat = _preview_material(stage, f"{looks}/WhiteSquares", (white,) * 3, "smooth")
-        dark_mat = _preview_material(stage, f"{looks}/DarkSquares", (dark_gray,) * 3, "smooth")
+        white_mat = _preview_material(stage, f"{looks}/WhiteSquares", (white,) * 3, roughness=0.5)
+        dark_mat = _preview_material(stage, f"{looks}/DarkSquares", (dark_gray,) * 3, roughness=0.5)
         markers = {tuple(getattr(env, "active_source_square", (-1, -1))),
                    tuple(getattr(env, "active_target_square", (-1, -1)))}
         for row in range(8):
@@ -241,8 +270,9 @@ def randomize_chess_appearance(
         for name in _PIECE_NAMES:
             if name not in env.scene.keys():
                 continue
-            shade = _uniform(0.73, 1.0) if name.endswith("white") else _uniform(0.035, 0.16)
+            shade = _uniform(0.82, 0.97) if name.endswith("white") else _uniform(0.045, 0.095)
             color = (shade,) * 3
-            finish = _random_finish()
-            material = _preview_material(stage, f"{looks}/{name}", color, finish)
-            _bind_visible_geometry(stage, _piece_root(env, name, env_id), material, finish)
+            material = _plastic_material(
+                stage, f"{looks}/{name}", color, roughness=_uniform(0.55, 0.7)
+            )
+            _bind_visible_geometry(stage, _piece_root(env, name, env_id), material)

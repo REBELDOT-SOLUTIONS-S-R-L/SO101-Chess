@@ -769,8 +769,8 @@ class So101ChessEventCfg:
         func=mdp.randomize_chess_appearance,
         mode="reset",
         params={
-            "light_intensity_range": (0.2, 2.0),
-            "light_temperature_range": (2500.0, 9000.0),
+            "light_intensity_range": (0.4, 2.0),
+            "light_temperature_range": (2500.0, 7000.0),
         },
     )
 
