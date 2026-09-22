@@ -489,6 +489,32 @@ class So101ChessSceneCfg(InteractiveSceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.12, 0.0, 0.8), rot=(1.0, 0.0, 0.0, 0.0)),
     )
 
+    # Separate bodies allow both piece color and board occupancy to vary.
+    rook_black: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/rook_black", spawn=_chess_piece_spawn_cfg(ROOK_USD_PATH),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(10.0, 10.0, 0.8), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+    knight_black: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/knight_black", spawn=_chess_piece_spawn_cfg(KNIGHT_USD_PATH),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(10.2, 10.0, 0.8), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+    bishop_black: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/bishop_black", spawn=_chess_piece_spawn_cfg(BISHOP_USD_PATH),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(10.4, 10.0, 0.8), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+    queen_black: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/queen_black", spawn=_chess_piece_spawn_cfg(QUEEN_USD_PATH),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(10.6, 10.0, 0.8), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+    king_black: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/king_black", spawn=_chess_piece_spawn_cfg(KING_USD_PATH),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(10.8, 10.0, 0.8), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+    pawn_black: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/pawn_black", spawn=_chess_piece_spawn_cfg(PAWN_USD_PATH),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(11.0, 10.0, 0.8), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
 # =====================================================================
 # 2) ACTIONS
 # =====================================================================
@@ -722,12 +748,29 @@ class So101ChessEventCfg:
                 "bishop_white",
                 "queen_white",
                 "king_white",
+                "pawn_black",
+                "rook_black",
+                "knight_black",
+                "bishop_black",
+                "queen_black",
+                "king_black",
             ],
             "seed": 0,
             "board_size": 8,
             "z_offset": 0.001,
             "advance_on_success_only": True,
             "sampling_strategy": "sobol",
+            "min_pieces": 1,
+            "max_pieces": 6,
+        },
+    )
+
+    randomize_appearance = EventTerm(
+        func=mdp.randomize_chess_appearance,
+        mode="reset",
+        params={
+            "light_intensity_range": (0.2, 2.0),
+            "light_temperature_range": (2500.0, 9000.0),
         },
     )
 

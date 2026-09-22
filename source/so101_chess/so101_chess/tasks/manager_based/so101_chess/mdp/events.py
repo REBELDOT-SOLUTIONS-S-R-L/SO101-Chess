@@ -87,6 +87,12 @@ _DEFAULT_CHESS_PIECES = (
     "bishop_white",
     "queen_white",
     "king_white",
+    "pawn_black",
+    "rook_black",
+    "knight_black",
+    "bishop_black",
+    "queen_black",
+    "king_black",
 )
 
 
@@ -300,6 +306,8 @@ def sample_chess_move_reset(
     z_offset: float = 0.001,
     advance_on_success_only: bool = False,
     sampling_strategy: str = "sobol",
+    min_pieces: int = 1,
+    max_pieces: int = 6,
 ):
     """Sample a chess move, place the piece, and paint its board squares.
 
@@ -310,11 +318,19 @@ def sample_chess_move_reset(
     accepts ``"sobol"`` for coverage-oriented recording or ``"random"`` for
     ordinary generation-time randomization.
     """
+    if not 1 <= min_pieces <= max_pieces <= len(_DEFAULT_CHESS_PIECES):
+        raise ValueError("piece count must satisfy 1 <= min_pieces <= max_pieces <= 12")
     if env_ids is None:
         env_ids = torch.arange(env.num_envs, dtype=torch.long, device=env.device)
+    elif isinstance(env_ids, slice):
+        env_ids = torch.arange(env.num_envs, dtype=torch.long, device=env.device)[env_ids]
+    else:
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=env.device)
+    if env_ids.numel() == 0:
+        return None
 
     scene_keys = set(env.scene.keys())
-    available_piece_names = [name for name in scene_keys if isinstance(name, str) and name in set(_DEFAULT_CHESS_PIECES)]
+    available_piece_names = [name for name in _DEFAULT_CHESS_PIECES if name in scene_keys]
     if not available_piece_names and piece_names is not None:
         available_piece_names = [name for name in piece_names if isinstance(name, str) and name in scene_keys]
 
@@ -381,34 +397,74 @@ def sample_chess_move_reset(
 
     piece_name, source_square, target_square = state["move"]
 
-    moved_off_board = []
-    for other_piece in available_piece_names:
-        if isinstance(other_piece, str) and other_piece != piece_name:
-            move_piece_off_board(env, env_ids, other_piece)
-            moved_off_board.append(other_piece)
+    # Keep the goal and the grasp approach clear. For sliding pieces also
+    # exclude squares along the move, so distractors cannot block the move.
+    reserved = {tuple(source_square), tuple(target_square)}
+    for center in (source_square, target_square):
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                candidate = (center[0] + dr, center[1] + dc)
+                if _in_bounds(candidate, board_size):
+                    reserved.add(candidate)
+    dr = target_square[0] - source_square[0]
+    dc = target_square[1] - source_square[1]
+    if "knight" not in piece_name and (dr == 0 or dc == 0 or abs(dr) == abs(dc)):
+        step_r = (dr > 0) - (dr < 0)
+        step_c = (dc > 0) - (dc < 0)
+        for step in range(1, max(abs(dr), abs(dc))):
+            reserved.add((source_square[0] + step * step_r, source_square[1] + step * step_c))
 
-    print(
-        f"[CHESS RESET] sampler={sampling_strategy} "
-        f"sample={'advanced' if should_advance else 'reused'} "
-        f"selected_piece={piece_name} source={source_square} target={target_square} "
-        f"off_board={moved_off_board}"
+    available_distractors = [name for name in available_piece_names if name != piece_name]
+    count = min(
+        len(available_piece_names),
+        int(torch.randint(min_pieces, max_pieces + 1, (1,)).item()),
     )
+    shuffled_names = torch.randperm(len(available_distractors)).tolist()
+    distractors = [available_distractors[index] for index in shuffled_names[:count - 1]]
+    for other_piece in available_distractors:
+        if other_piece not in distractors:
+            move_piece_off_board(env, env_ids, other_piece)
 
     env.active_piece_name = piece_name
     env.active_source_square = tuple(source_square)
     env.active_target_square = tuple(target_square)
+    if not hasattr(env, "chess_piece_squares"):
+        env.chess_piece_squares = {}
 
     active_piece = env.scene[piece_name]
     place_piece_on_square(env, env_ids, piece_name, source_square, z_offset=z_offset)
-    # A piece that was inactive in the preceding episode is asleep. Wake it
-    # after writing the reset pose so contacts begin on the first physics step.
     _set_piece_awake(active_piece, env_ids, awake=True)
+    for env_id in env_ids.cpu().tolist():
+        # Each environment gets independently shuffled, non-overlapping
+        # distractor positions. Their names and number are shared because this
+        # task's active-piece state is currently shared across environments.
+        candidate_squares = [
+            (row, col) for row in range(board_size) for col in range(board_size)
+            if (row, col) not in reserved
+        ]
+        order = torch.randperm(len(candidate_squares)).tolist()
+        placements = {piece_name: tuple(source_square)}
+        for name, index in zip(distractors, order):
+            square = candidate_squares[index]
+            place_piece_on_square(
+                env, torch.tensor([env_id], device=env.device), name, square, z_offset=z_offset
+            )
+            _set_piece_awake(env.scene[name], torch.tensor([env_id], device=env.device), awake=True)
+            placements[name] = square
+        env.chess_piece_squares[env_id] = placements
+
     color_board_squares(
         env,
         env_ids,
         reset_to_default=True,
         red_squares=[source_square],
         green_squares=[target_square],
+    )
+    print(
+        f"[CHESS RESET] sampler={sampling_strategy} "
+        f"sample={'advanced' if should_advance else 'reused'} "
+        f"selected_piece={piece_name} source={source_square} target={target_square} "
+        f"piece_count={count}"
     )
     return piece_name, source_square, target_square
 
