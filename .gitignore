@@ -1,0 +1,20 @@
+# Generated demonstrations and simulator outputs
+datasets/
+*.hdf5
+*.h5
+logs/
+outputs/
+checkpoints/
+
+# Python and packaging artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Local editor and machine settings
+.claude/settings.local.json
+.DS_Store

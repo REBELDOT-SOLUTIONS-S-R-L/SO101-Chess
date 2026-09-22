@@ -1,0 +1,31 @@
+
+## GENERATE DATASET
+/home/roboticslab/IsaacTools/.venv/bin/python /home/roboticslab/IsaacTools/IsaacTasks/so101_chess/scripts/generate_dataset.py \
+    --task LeIsaac-SO101-Chess-v0-Mimic \
+    --input_file /home/roboticslab/IsaacTools/IsaacTasks/so101_chess/datasets/annotated_dataset_2.hdf5 \
+    --output_file /home/roboticslab/IsaacTools/IsaacTasks/so101_chess/datasets/chess_generated_standard_5.hdf5 \
+    --generation_num_trials 10 \
+    --num_envs 1 \
+    --dataset_schema standard \
+    --enable_pinocchio --enable_cameras
+
+## RECORD
+cd /home/roboticslab/IsaacTools/IsaacTasks/so101_chess
+/home/roboticslab/IsaacTools/.venv/bin/python scripts/record_annotated_demos.py \
+    --task LeIsaac-SO101-Chess-v0-Mimic \
+    --teleop_device so101leader \
+    --port /dev/ttyUSB0 \
+    --enable_pinocchio \
+    --dataset_file ./datasets/annotated_dataset_2.hdf5 --enable_cameras
+
+## RUN INFERENCE SERVER
+
+    source /home/roboticslab/lerobot/.venv/bin/activate
+    cd /home/roboticslab/IsaacTools/IsaacTasks/so101_chess
+    python scripts/xvla_inference_server.py
+
+
+## RUN EVAL
+  source /home/roboticslab/IsaacTools/.venv/bin/activate
+  cd /home/roboticslab/IsaacTools/IsaacTasks/so101_chess
+  python scripts/eval_xvla.py --enable_cameras --episodes 10
