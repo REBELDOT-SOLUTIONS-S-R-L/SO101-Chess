@@ -47,6 +47,7 @@ def test_chess_move_reset_advances_only_after_success(monkeypatch):
 
     monkeypatch.setattr(chess_events, "move_piece_off_board", lambda *args, **kwargs: None)
     monkeypatch.setattr(chess_events, "place_piece_on_square", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chess_events, "_set_piece_awake", lambda *args, **kwargs: None)
     monkeypatch.setattr(chess_events, "color_board_squares", lambda *args, **kwargs: None)
 
     reset_kwargs = {
@@ -87,6 +88,7 @@ def test_chess_move_reset_uses_fresh_random_move_on_every_reset(monkeypatch):
 
     monkeypatch.setattr(chess_events, "move_piece_off_board", lambda *args, **kwargs: None)
     monkeypatch.setattr(chess_events, "place_piece_on_square", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chess_events, "_set_piece_awake", lambda *args, **kwargs: None)
     monkeypatch.setattr(chess_events, "color_board_squares", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         chess_events,
@@ -110,3 +112,47 @@ def test_chess_move_reset_uses_fresh_random_move_on_every_reset(monkeypatch):
     assert first_move == ("rook_white", (0, 0), (0, 1))
     assert second_move == ("rook_white", (1, 0), (1, 1))
     assert env._chess_move_reset_state["count"] == 2
+
+
+def test_generation_reset_uses_only_source_piece_types(monkeypatch):
+    class Env:
+        num_envs = 1
+        device = "cpu"
+        scene = {"rook_white": object(), "knight_white": object()}
+        _chess_pickup_source_piece_types = frozenset({"rook"})
+        _chess_move_reset_state = {
+            "count": 1,
+            "move": ("knight_white", (0, 0), (1, 2)),
+        }
+
+    env = Env()
+    env_ids = torch.tensor([0], dtype=torch.long)
+    captured = {}
+
+    monkeypatch.setattr(chess_events, "move_piece_off_board", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chess_events, "place_piece_on_square", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chess_events, "_set_piece_awake", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chess_events, "color_board_squares", lambda *args, **kwargs: None)
+
+    def sample_random(**kwargs):
+        captured.update(kwargs)
+        return "rook_white", (0, 0), (0, 1)
+
+    monkeypatch.setattr(chess_events, "sample_chess_move_random", sample_random)
+
+    move = chess_events.sample_chess_move_reset(
+        env,
+        env_ids,
+        piece_names=["rook_white", "knight_white"],
+        sampling_strategy="random",
+        advance_on_success_only=False,
+        min_pieces=1,
+        max_pieces=1,
+    )
+
+    assert move == ("rook_white", (0, 0), (0, 1))
+    assert captured["piece_names"] == ["rook_white"]
+    assert env._chess_move_reset_state["count"] == 2
+    # Unsupported geometry may still appear as a distractor; it is excluded
+    # only from active pickup sampling.
+    assert set(captured["available_piece_names"]) == {"rook_white", "knight_white"}

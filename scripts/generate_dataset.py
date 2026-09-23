@@ -154,7 +154,11 @@ def setup_chess_async_generation(
         asyncio_lock=info_pool_lock,
     )
     info_pool.load_from_dataset_file(input_file)
-    print(f"Loaded {info_pool.num_datagen_infos} to chess datagen info pool")
+    pickup_types = sorted(set(info_pool.piece_types))
+    print(
+        f"Loaded {info_pool.num_datagen_infos} to chess datagen info pool; "
+        f"generation reset types: {pickup_types}"
+    )
 
     data_generator = ChessPickupDataGenerator(env=env, src_demo_datagen_info_pool=info_pool)
     tasks = []

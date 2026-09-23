@@ -20,6 +20,7 @@ import omni.usd
 import torch
 from pxr import Gf, PhysicsSchemaTools, Sdf, UsdShade
 
+from ..piece_types import normalize_piece_type
 from .board import square_surface_position
 
 if TYPE_CHECKING:
@@ -337,10 +338,33 @@ def sample_chess_move_reset(
     if piece_names is None:
         piece_names = available_piece_names or list(_DEFAULT_CHESS_PIECES)
 
+    source_piece_types = getattr(env, "_chess_pickup_source_piece_types", None)
+    if source_piece_types is not None:
+        source_piece_types = set(source_piece_types)
+        piece_names = [
+            name
+            for name in piece_names
+            if isinstance(name, str) and normalize_piece_type(name) in source_piece_types
+        ]
+        if not piece_names:
+            raise ValueError(
+                "No configured chess piece has a source pickup demonstration. "
+                f"Source piece types: {sorted(source_piece_types)}"
+            )
+
     state = getattr(env, "_chess_move_reset_state", None)
     if state is None:
         state = {"count": 0}
         setattr(env, "_chess_move_reset_state", state)
+
+    cached_move = state.get("move")
+    if source_piece_types is not None and cached_move is not None:
+        cached_piece_type = normalize_piece_type(cached_move[0])
+        if cached_piece_type not in source_piece_types:
+            # The application performs an initial reset before the source
+            # dataset is loaded. Discard that cached move if its geometry is
+            # absent from the source pool so the next reset samples again.
+            state["move"] = None
 
     episode_succeeded = False
     succeeded = getattr(env, "_chess_move_episode_succeeded", None)

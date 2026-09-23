@@ -31,9 +31,17 @@ class ChessDataGenInfoPool(DataGenInfoPool):
     def load_from_dataset_file(self, file_path, select_demo_keys: str | None = None):
         self._loading_dataset_file = True
         try:
-            return super().load_from_dataset_file(file_path, select_demo_keys=select_demo_keys)
+            result = super().load_from_dataset_file(file_path, select_demo_keys=select_demo_keys)
         finally:
             self._loading_dataset_file = False
+
+        source_piece_types = frozenset(self.piece_types)
+        if not source_piece_types:
+            raise ValueError("The source dataset contains no pickup piece types")
+        # The next generation reset must sample only types for which strict
+        # type-filtered pickup has at least one source demonstration.
+        self.env._chess_pickup_source_piece_types = source_piece_types
+        return result
 
     def _add_episode(self, episode):
         root_attrs = episode.attrs.get("", {}) if isinstance(episode.attrs, dict) else {}
