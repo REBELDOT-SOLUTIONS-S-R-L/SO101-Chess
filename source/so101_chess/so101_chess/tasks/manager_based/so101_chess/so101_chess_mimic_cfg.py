@@ -170,14 +170,9 @@ class So101ChessMimicEnvCfg(So101ChessTaskCfg, MimicEnvCfg):
                 object_ref="destination_square",
                 subtask_term_signal="lift_after_place",
                 subtask_term_offset_range=(0, 0),
-                selection_strategy="nearest_neighbor_multi_object",
+                selection_strategy="source_from_subtask",
                 selection_strategy_kwargs={
-                    "object_names": ["active_piece", "destination_square"],
-                    "object_weights": {"active_piece": 1.0, "destination_square": 1.0},
-                    "pos_weight": 1.0,
-                    "rot_weight": 0.0,
-                    "aggregation": "max",
-                    "nn_k": 3,
+                    "source_subtask": "place_object"
                 },
                 action_noise=0.0,
                 num_interpolation_steps=5,
