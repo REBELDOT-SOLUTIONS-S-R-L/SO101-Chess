@@ -575,7 +575,7 @@ class So101ChessLeaderActionsCfg:
         offset={"wrist_roll": WRIST_ROLL_LEADER_OFFSET},
         use_default_offset=False,
         preserve_order=True,
-        max_velocity=2.0,
+        max_velocity=None,
         block_downward_near_board=True,
         eef_body_name="gripper_frame_link",
         gripper_joint_name="gripper",

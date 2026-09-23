@@ -31,7 +31,11 @@ class SlewRateLimitedJointPositionAction(JointPositionAction):
     def __init__(self, cfg: "SlewRateLimitedJointPositionActionCfg", env) -> None:
         super().__init__(cfg, env)
         self._previous_target = self._asset.data.default_joint_pos[:, self._joint_ids].clone()
-        self._max_delta = float(cfg.max_velocity) * float(env.step_dt)
+        if cfg.max_velocity is not None and cfg.max_velocity <= 0.0:
+            raise ValueError("max_velocity must be positive or None")
+        self._max_delta = (
+            None if cfg.max_velocity is None else float(cfg.max_velocity) * float(env.step_dt)
+        )
         if isinstance(self._joint_ids, slice):
             joint_ids = list(range(self._asset.num_joints))[self._joint_ids]
         else:
@@ -99,12 +103,15 @@ class SlewRateLimitedJointPositionAction(JointPositionAction):
 
     def process_actions(self, actions: torch.Tensor) -> None:
         super().process_actions(actions)
-        delta = torch.clamp(
-            self._processed_actions - self._previous_target,
-            min=-self._max_delta,
-            max=self._max_delta,
-        )
-        targets = self._previous_target + delta
+        if self._max_delta is None:
+            targets = self._processed_actions
+        else:
+            delta = torch.clamp(
+                self._processed_actions - self._previous_target,
+                min=-self._max_delta,
+                max=self._max_delta,
+            )
+            targets = self._previous_target + delta
         targets = self._block_downward_board_contact(targets)
         self._processed_actions = targets
         self._previous_target[:] = targets
@@ -124,8 +131,8 @@ class SlewRateLimitedJointPositionActionCfg(JointPositionActionCfg):
 
     class_type: type = SlewRateLimitedJointPositionAction
 
-    max_velocity: float = 1.0
-    """Maximum target slew rate in radians per second."""
+    max_velocity: float | None = 1.0
+    """Maximum target slew rate in radians per second; ``None`` disables the software cap."""
 
     block_downward_near_board: bool = False
     """Reject downward end-effector commands while a held piece touches the board."""
