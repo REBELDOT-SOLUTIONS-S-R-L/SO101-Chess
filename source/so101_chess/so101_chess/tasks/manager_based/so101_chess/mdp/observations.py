@@ -7,7 +7,8 @@
 
 These helpers implement the subtask termination predicates used by the Mimic
 annotated recorder for the chess move sequence:
-    move_over_source -> grasp_object -> lift_object -> move_over_destination -> place_object -> return_home
+    move_over_source -> grasp_object -> lift_object -> move_over_destination ->
+    place_object -> lift_after_place -> return_home
 """
 
 from __future__ import annotations
@@ -98,6 +99,7 @@ _SUBTASK_ORDER = (
     "lift_object",
     "move_over_destination",
     "place_object",
+    "lift_after_place",
     "return_home",
 )
 
@@ -183,6 +185,10 @@ def reset_chess_subtask_stage(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> 
         env._chess_subtask_last_counted_step[env_ids] = -1
     if hasattr(env, "_chess_subtask_failed"):
         env._chess_subtask_failed[env_ids] = False
+    if hasattr(env, "_chess_post_place_lift_initialized"):
+        env._chess_post_place_lift_initialized[env_ids] = False
+    if hasattr(env, "_chess_post_place_lift_start"):
+        env._chess_post_place_lift_start[env_ids] = 0
     if hasattr(env, "_chess_home_hold_counter"):
         env._chess_home_hold_counter[env_ids] = 0
     if hasattr(env, "_chess_home_last_counted_step"):
@@ -498,6 +504,83 @@ def place_object_done(
     _mark_chess_failed(env, is_pending & (bad_release | lost_grip | fell_z | fell_xy))
 
     return _subtask_gate(env, "place_object", done, max_steps=max_steps)
+
+
+def lift_after_place_done(
+    env: ManagerBasedRLEnv,
+    eef_link: str = "gripper_frame_link",
+    object_name: str | None = None,
+    lift_z_offset: float = 0.05,
+    max_xy_drift: float = 0.02,
+    gripper_joint_pattern: str = "gripper",
+    gripper_open_threshold: float = 0.2,
+    target_xy_threshold: float = 0.02,
+    target_z_threshold: float = 0.02,
+    piece_max_tilt_deg: float = 75.0,
+    max_steps: int = 300,
+    signal_name: str | None = None,
+) -> torch.Tensor:
+    """Latch a short vertical retreat after releasing the piece.
+
+    The end-effector pose is captured when placement advances into this stage.
+    Completion requires moving upward by ``lift_z_offset`` without translating
+    farther than ``max_xy_drift`` in the board plane. The released piece must
+    remain valid on its destination square throughout the retreat.
+    """
+    if lift_z_offset <= 0.0:
+        raise ValueError("lift_z_offset must be positive.")
+    if max_xy_drift < 0.0:
+        raise ValueError("max_xy_drift must be nonnegative.")
+
+    eef = _eef_position(env, eef_link)
+    if not hasattr(env, "_chess_post_place_lift_start"):
+        env._chess_post_place_lift_start = torch.zeros_like(eef)
+    if not hasattr(env, "_chess_post_place_lift_initialized"):
+        env._chess_post_place_lift_initialized = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=env.device
+        )
+
+    start = env._chess_post_place_lift_start
+    initialized = env._chess_post_place_lift_initialized
+    is_pending = _is_stage_pending(env, "lift_after_place")
+    capture = is_pending & ~initialized
+    start[capture] = eef[capture]
+    initialized[capture] = True
+
+    xy_drift = torch.linalg.vector_norm(eef[:, :2] - start[:, :2], dim=-1)
+    vertical_lift = eef[:, 2] - start[:, 2]
+    grip = _gripper_joint_mean(env, gripper_joint_pattern)
+    opened = grip >= gripper_open_threshold
+
+    if object_name is None:
+        object_name = _get_active_piece_name(env)
+    piece = env.scene[object_name]
+    obj = piece.data.root_pos_w - env.scene.env_origins
+    target = _source_target_world(env, "target").unsqueeze(0).expand_as(obj)
+    piece_still_placed = _piece_on_square(
+        obj,
+        piece.data.root_quat_w,
+        target,
+        target_xy_threshold,
+        target_z_threshold,
+        piece_max_tilt_deg,
+    )
+
+    straight = xy_drift <= max_xy_drift
+    lifted = vertical_lift >= lift_z_offset
+    done = (initialized & straight & lifted & opened & piece_still_placed).float().unsqueeze(-1)
+    _debug_print_subtask(
+        env,
+        signal_name,
+        "lift_after_place",
+        float(vertical_lift[0].item()),
+        float(lift_z_offset),
+        unit="m",
+    )
+
+    invalid_retreat = ~straight | ~opened | ~piece_still_placed
+    _mark_chess_failed(env, is_pending & initialized & invalid_retreat)
+    return _subtask_gate(env, "lift_after_place", done, max_steps=max_steps)
 
 
 def return_home_done(

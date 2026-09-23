@@ -697,6 +697,21 @@ class So101ChessObservationsCfg:
                 "max_steps": 300,
             },
         )
+        lift_after_place = ObsTerm(
+            func=mdp.lift_after_place_done,
+            params={
+                "eef_link": "gripper_frame_link",
+                "object_name": None,
+                "lift_z_offset": 0.05,
+                "max_xy_drift": 0.02,
+                "gripper_joint_pattern": "gripper",
+                "gripper_open_threshold": GRIPPER_CLOSED_THRESHOLD,
+                "target_xy_threshold": 0.02,
+                "target_z_threshold": 0.02,
+                "piece_max_tilt_deg": RETURN_HOME_START_MAX_TILT_DEG,
+                "max_steps": 300,
+            },
+        )
         return_home = ObsTerm(
             func=mdp.return_home_done,
             params={

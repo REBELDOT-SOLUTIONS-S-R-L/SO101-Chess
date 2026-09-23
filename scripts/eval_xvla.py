@@ -58,6 +58,7 @@ SUBTASK_STAGES = (
     "lift_object",
     "move_over_destination",
     "place_object",
+    "lift_after_place",
     "return_home",
 )
 
@@ -177,7 +178,7 @@ def main() -> None:
                     print(
                         f"Episode {completed}: {result} after {episode_steps} steps; "
                         f"max arm excursion {max_arm_excursion:.2f} rad; "
-                        f"next subtask {SUBTASK_STAGES[max_stage] if max_stage < 6 else 'all complete'}; "
+                        f"next subtask {SUBTASK_STAGES[max_stage] if max_stage < len(SUBTASK_STAGES) else 'all complete'}; "
                         f"{successes} successes",
                         flush=True,
                     )
