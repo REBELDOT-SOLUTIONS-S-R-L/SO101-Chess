@@ -172,9 +172,9 @@ class So101PinkInverseKinematicsAction(PinkInverseKinematicsAction):
             & (requested_vertical_motion < 0.0)
         )
         if stage is not None:
-            # The sixth stage is return_home. Once place_object has latched,
-            # the nearby resting piece is no longer held by the gripper.
-            blocked &= stage < 5
+            # Once place_object (stage 5) has latched, the nearby resting
+            # piece is no longer held by the gripper.
+            blocked &= stage < 6
         return torch.where(blocked.unsqueeze(-1), current, targets)
 
     def process_actions(self, actions: torch.Tensor) -> None:

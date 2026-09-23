@@ -22,6 +22,8 @@ from isaaclab.envs.mdp.recorders.recorders_cfg import StandardInitialStateRecord
 from isaaclab.utils import configclass
 from isaaclab.utils.datasets import EpisodeData, StandardHDF5DatasetFileHandler
 
+from .piece_types import normalize_piece_type
+
 
 ACTIVE_PIECE_DATASET_NAME = "active_piece"
 REBELHDF5_SINGLE_ARM_REFERENCE_KEY = "left"
@@ -73,13 +75,21 @@ class RebelHDF5CompatibleDatasetFileHandler(StandardHDF5DatasetFileHandler):
     def __init__(self):
         super().__init__()
         self._reference_source_key: str | None = None
+        self._env = None
 
     def set_recorder_metadata(self, cfg, env, failed: bool = False):
         super().set_recorder_metadata(cfg, env, failed=failed)
+        self._env = env
         if len(self._entity_order) == 1:
             self._reference_source_key = self._entity_order[0]
 
     def write_episode(self, episode: EpisodeData, demo_id: int | None = None):
+        piece_name = getattr(self._env, "active_piece_name", None)
+        if not isinstance(piece_name, str):
+            raise RuntimeError("Cannot export a chess demonstration without env.active_piece_name")
+        piece_type = normalize_piece_type(piece_name)
+        episode_group_name = f"demo_{demo_id}" if demo_id is not None else f"demo_{self._demo_count}"
+
         references = episode.data.get("reference_demo_indices")
         alias_added = False
         if (
@@ -92,6 +102,10 @@ class RebelHDF5CompatibleDatasetFileHandler(StandardHDF5DatasetFileHandler):
 
         try:
             super().write_episode(episode, demo_id=demo_id)
+            # Keep geometry identity explicit even though the manipulated
+            # rigid object uses the stable active_piece alias and color is
+            # intentionally normalized away.
+            self._hdf5_data_group[episode_group_name].attrs["piece_type"] = piece_type
         finally:
             # The alias belongs to the serialized compatibility surface, not
             # the in-memory canonical EpisodeData used by Isaac Lab.

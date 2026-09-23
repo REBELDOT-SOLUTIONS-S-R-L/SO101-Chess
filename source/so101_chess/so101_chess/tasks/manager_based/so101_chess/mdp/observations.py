@@ -7,8 +7,8 @@
 
 These helpers implement the subtask termination predicates used by the Mimic
 annotated recorder for the chess move sequence:
-    move_over_source -> grasp_object -> lift_object -> move_over_destination ->
-    place_object -> lift_after_place -> return_home
+    move_over_source -> pregrasp_align -> grasp -> lift_object ->
+    move_over_destination -> place_object -> lift_after_place -> return_home
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import time
 from typing import TYPE_CHECKING
 
 import torch
-from isaaclab.utils.math import quat_apply, quat_apply_inverse
+from isaaclab.utils.math import matrix_from_quat, quat_apply, quat_apply_inverse, quat_inv, quat_mul
 
 from .board import square_surface_position
 
@@ -95,7 +95,8 @@ _LAST_SUBTASK_LOG_TS = 0.0
 
 _SUBTASK_ORDER = (
     "move_over_source",
-    "grasp_object",
+    "pregrasp_align",
+    "grasp",
     "lift_object",
     "move_over_destination",
     "place_object",
@@ -104,11 +105,113 @@ _SUBTASK_ORDER = (
 )
 
 
+def _ensure_pickup_state(env: ManagerBasedRLEnv) -> None:
+    """Create per-environment pickup ownership and pose-stability buffers."""
+    if not hasattr(env, "_chess_pickup_source_demo_ids"):
+        env._chess_pickup_source_demo_ids = torch.full(
+            (env.num_envs,), -1, dtype=torch.long, device=env.device
+        )
+    if not hasattr(env, "_chess_pregrasp_target_pose"):
+        env._chess_pregrasp_target_pose = torch.eye(
+            4, dtype=torch.float32, device=env.device
+        ).unsqueeze(0).repeat(env.num_envs, 1, 1)
+    if not hasattr(env, "_chess_pregrasp_target_valid"):
+        env._chess_pregrasp_target_valid = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=env.device
+        )
+    if not hasattr(env, "_chess_pregrasp_target_external"):
+        env._chess_pregrasp_target_external = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=env.device
+        )
+    if not hasattr(env, "_chess_pregrasp_hold_counter"):
+        env._chess_pregrasp_hold_counter = torch.zeros(
+            env.num_envs, dtype=torch.long, device=env.device
+        )
+    if not hasattr(env, "_chess_pregrasp_prev_pose"):
+        env._chess_pregrasp_prev_pose = torch.eye(
+            4, dtype=torch.float32, device=env.device
+        ).unsqueeze(0).repeat(env.num_envs, 1, 1)
+    if not hasattr(env, "_chess_pregrasp_last_counted_step"):
+        env._chess_pregrasp_last_counted_step = torch.full(
+            (env.num_envs,), -1, dtype=torch.long, device=env.device
+        )
+    if not hasattr(env, "_chess_grasp_hold_counter"):
+        env._chess_grasp_hold_counter = torch.zeros(
+            env.num_envs, dtype=torch.long, device=env.device
+        )
+    if not hasattr(env, "_chess_grasp_prev_grip"):
+        env._chess_grasp_prev_grip = torch.zeros(
+            env.num_envs, dtype=torch.float32, device=env.device
+        )
+    if not hasattr(env, "_chess_grasp_prev_pose"):
+        env._chess_grasp_prev_pose = torch.eye(
+            4, dtype=torch.float32, device=env.device
+        ).unsqueeze(0).repeat(env.num_envs, 1, 1)
+    if not hasattr(env, "_chess_grasp_last_counted_step"):
+        env._chess_grasp_last_counted_step = torch.full(
+            (env.num_envs,), -1, dtype=torch.long, device=env.device
+        )
+
+
+def set_pickup_source_demo_id(env: ManagerBasedRLEnv, env_id: int, source_demo_id: int) -> None:
+    """Latch the source episode that owns pregrasp, grasp and lift."""
+    _ensure_pickup_state(env)
+    current = int(env._chess_pickup_source_demo_ids[env_id].item())
+    if current >= 0 and current != int(source_demo_id):
+        raise RuntimeError(f"Pickup source is already latched to {current}, cannot replace it with {source_demo_id}")
+    env._chess_pickup_source_demo_ids[env_id] = int(source_demo_id)
+
+
+def get_pickup_source_demo_id(env: ManagerBasedRLEnv, env_id: int) -> int:
+    """Return the active pickup source episode, or -1 when none is owned."""
+    _ensure_pickup_state(env)
+    return int(env._chess_pickup_source_demo_ids[env_id].item())
+
+
+def set_pregrasp_target_pose(env: ManagerBasedRLEnv, env_id: int, target_pose: torch.Tensor) -> None:
+    """Store the transformed demonstrated grasp pose for measured-pose checks."""
+    _ensure_pickup_state(env)
+    env._chess_pregrasp_target_pose[env_id] = target_pose.to(
+        device=env.device, dtype=env._chess_pregrasp_target_pose.dtype
+    )
+    env._chess_pregrasp_target_valid[env_id] = True
+    env._chess_pregrasp_target_external[env_id] = True
+    env._chess_pregrasp_hold_counter[env_id] = 0
+    env._chess_grasp_hold_counter[env_id] = 0
+
+
+def clear_pickup_state(env: ManagerBasedRLEnv, env_ids) -> None:
+    """Clear pickup ownership after lift completion, reset, or an aborted attempt."""
+    _ensure_pickup_state(env)
+    env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=env.device).reshape(-1)
+    if env_ids.numel() == 0:
+        return
+    env._chess_pickup_source_demo_ids[env_ids] = -1
+    env._chess_pregrasp_target_valid[env_ids] = False
+    env._chess_pregrasp_target_external[env_ids] = False
+    env._chess_pregrasp_hold_counter[env_ids] = 0
+    env._chess_pregrasp_last_counted_step[env_ids] = -1
+    env._chess_grasp_hold_counter[env_ids] = 0
+    env._chess_grasp_last_counted_step[env_ids] = -1
+
+
+def _pose_error(current: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return position and geodesic orientation error for batched poses."""
+    position_error = torch.linalg.vector_norm(current[:, :3, 3] - target[:, :3, 3], dim=-1)
+    delta = current[:, :3, :3] @ target[:, :3, :3].transpose(-1, -2)
+    cosine = (torch.diagonal(delta, dim1=-2, dim2=-1).sum(dim=-1) - 1.0) / 2.0
+    orientation_error = torch.acos(torch.clamp(cosine, -1.0, 1.0))
+    return position_error, orientation_error
+
+
 def _mark_chess_failed(env: ManagerBasedRLEnv, mask: torch.Tensor) -> None:
     """OR ``mask`` into the per-env chess-move fail latch read by ``chess_move_failed``."""
     if not hasattr(env, "_chess_subtask_failed"):
         env._chess_subtask_failed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     env._chess_subtask_failed |= mask
+    failed_env_ids = torch.nonzero(mask, as_tuple=False).flatten()
+    if failed_env_ids.numel() > 0:
+        clear_pickup_state(env, failed_env_ids)
 
 
 def get_chess_subtask_failed(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -185,6 +288,7 @@ def reset_chess_subtask_stage(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> 
         env._chess_subtask_last_counted_step[env_ids] = -1
     if hasattr(env, "_chess_subtask_failed"):
         env._chess_subtask_failed[env_ids] = False
+    clear_pickup_state(env, env_ids)
     if hasattr(env, "_chess_post_place_lift_initialized"):
         env._chess_post_place_lift_initialized[env_ids] = False
     if hasattr(env, "_chess_post_place_lift_start"):
@@ -227,6 +331,19 @@ def _eef_position_robot_root(env: ManagerBasedRLEnv, eef_link: str) -> torch.Ten
     body_index = robot.data.body_names.index(eef_link)
     root_to_eef_w = robot.data.body_pos_w[:, body_index] - robot.data.root_pos_w
     return quat_apply_inverse(robot.data.root_quat_w, root_to_eef_w)
+
+
+def _eef_pose_robot_root(env: ManagerBasedRLEnv, eef_link: str) -> torch.Tensor:
+    """Return the measured end-effector pose in the robot-root frame."""
+    robot = env.scene["robot"]
+    body_index = robot.data.body_names.index(eef_link)
+    root_to_eef_w = robot.data.body_pos_w[:, body_index] - robot.data.root_pos_w
+    position = quat_apply_inverse(robot.data.root_quat_w, root_to_eef_w)
+    orientation = quat_mul(quat_inv(robot.data.root_quat_w), robot.data.body_quat_w[:, body_index])
+    pose = torch.eye(4, dtype=position.dtype, device=position.device).unsqueeze(0).repeat(env.num_envs, 1, 1)
+    pose[:, :3, :3] = matrix_from_quat(orientation)
+    pose[:, :3, 3] = position
+    return pose
 
 
 def _piece_upright(piece_quat_w: torch.Tensor, max_tilt_deg: float) -> torch.Tensor:
@@ -281,8 +398,9 @@ def move_over_source_done(
     env: ManagerBasedRLEnv,
     eef_link: str,
     object_name: str | None = None,
-    dist_threshold: float = 0.07,
-    z_offset: float = 0.15,
+    hover_z_offset: float = 0.10,
+    hover_xy_tolerance: float = 0.025,
+    hover_z_tolerance: float = 0.015,
     gripper_joint_pattern: str = "gripper",
     gripper_open_threshold: float = 0.5,
     piece_source_xy_threshold: float = 0.05,
@@ -291,65 +409,209 @@ def move_over_source_done(
     max_steps: int = 300,
     signal_name: str | None = None,
 ) -> torch.Tensor:
-    """Latch the source approach, failing if the untouched piece leaves its red square."""
+    """Latch only at the defined open-gripper hover pose above the active piece."""
+    if hover_z_offset <= 0.0:
+        raise ValueError("hover_z_offset must be positive")
+
     eef = _eef_position(env, eef_link)
     source = _source_target_world(env, "source").unsqueeze(0).expand_as(eef)
-    xy_dist = torch.norm(eef[:, :2] - source[:, :2], dim=-1)
-    z_ok = torch.abs(eef[:, 2] - source[:, 2]) <= z_offset
+    if object_name is None:
+        object_name = _get_active_piece_name(env)
+    piece = env.scene[object_name]
+    obj = piece.data.root_pos_w - env.scene.env_origins
+
+    # Center the hover target on the measured piece XY while keeping a fixed,
+    # geometry-independent clearance above the board surface.
+    hover = source.clone()
+    hover[:, :2] = obj[:, :2]
+    hover[:, 2] += hover_z_offset
+    xy_error = torch.linalg.vector_norm(eef[:, :2] - hover[:, :2], dim=-1)
+    z_error = torch.abs(eef[:, 2] - hover[:, 2])
     grip = _gripper_joint_mean(env, gripper_joint_pattern)
-    near_xy = xy_dist <= dist_threshold
     open_grip = grip >= gripper_open_threshold
-    done = (near_xy & z_ok & open_grip).float().unsqueeze(-1)
+    done = (
+        (xy_error <= hover_xy_tolerance)
+        & (z_error <= hover_z_tolerance)
+        & open_grip
+    ).float().unsqueeze(-1)
     _debug_print_subtask(
-        env, signal_name, "move_over_source", float(xy_dist[0].item()), float(dist_threshold), unit="m"
+        env, signal_name, "move_over_source", float(z_error[0].item()), float(hover_z_tolerance), unit="m"
     )
+
+    piece_ready = _piece_on_square(
+        obj, piece.data.root_quat_w, source, piece_source_xy_threshold, piece_source_z_threshold, piece_max_tilt_deg
+    )
+    _mark_chess_failed(env, _is_stage_pending(env, "move_over_source") & ~piece_ready)
+    return _subtask_gate(env, "move_over_source", done, max_steps=max_steps)
+
+
+def pregrasp_align_done(
+    env: ManagerBasedRLEnv,
+    eef_link: str,
+    object_name: str | None = None,
+    gripper_joint_pattern: str = "gripper",
+    gripper_open_threshold: float = 0.3,
+    piece_dist_threshold: float = 0.08,
+    position_tolerance: float = 0.005,
+    orientation_tolerance: float = 0.05,
+    max_position_step: float = 0.0015,
+    max_orientation_step: float = 0.03,
+    stable_frames: int = 5,
+    piece_source_xy_threshold: float = 0.05,
+    piece_source_z_threshold: float = 0.03,
+    piece_max_tilt_deg: float = 30.0,
+    max_steps: int = 300,
+    signal_name: str | None = None,
+) -> torch.Tensor:
+    """Reach the selected demonstrated grasp pose with an open, stable gripper."""
+    if stable_frames < 1:
+        raise ValueError("stable_frames must be at least one")
+
+    pose = _eef_pose_robot_root(env, eef_link)
+    eef = _eef_position(env, eef_link)
+    _ensure_pickup_state(env)
+    if env._chess_pregrasp_target_pose.dtype != pose.dtype:
+        env._chess_pregrasp_target_pose = env._chess_pregrasp_target_pose.to(dtype=pose.dtype)
 
     if object_name is None:
         object_name = _get_active_piece_name(env)
     piece = env.scene[object_name]
     obj = piece.data.root_pos_w - env.scene.env_origins
+    source = _source_target_world(env, "source").unsqueeze(0).expand_as(obj)
     piece_ready = _piece_on_square(
         obj, piece.data.root_quat_w, source, piece_source_xy_threshold, piece_source_z_threshold, piece_max_tilt_deg
     )
-    _mark_chess_failed(env, _is_stage_pending(env, "move_over_source") & ~piece_ready)
+    grip = _gripper_joint_mean(env, gripper_joint_pattern)
+    open_grip = grip >= gripper_open_threshold
+    near_piece = torch.linalg.vector_norm(eef - obj, dim=-1) <= piece_dist_threshold
+    pending = _is_stage_pending(env, "pregrasp_align")
+    candidate_ready = pending & piece_ready & open_grip & near_piece
 
-    return _subtask_gate(env, "move_over_source", done, max_steps=max_steps)
+    target = env._chess_pregrasp_target_pose
+    valid = env._chess_pregrasp_target_valid
+    external = env._chess_pregrasp_target_external
+    position_error, orientation_error = _pose_error(pose, target)
+    refresh_target = candidate_ready & ~external & (
+        ~valid | (position_error > position_tolerance) | (orientation_error > orientation_tolerance)
+    )
+    target[refresh_target] = pose[refresh_target]
+    valid[refresh_target] = True
+    env._chess_pregrasp_hold_counter[refresh_target] = 0
+    position_error, orientation_error = _pose_error(pose, target)
+
+    previous_pose = env._chess_pregrasp_prev_pose
+    position_step, orientation_step = _pose_error(pose, previous_pose)
+    episode_step = env.episode_length_buf.to(device=env.device, dtype=torch.long)
+    last_counted = env._chess_pregrasp_last_counted_step
+    new_step = last_counted != episode_step
+    has_previous = last_counted >= 0
+    stable = (
+        candidate_ready
+        & valid
+        & (position_error <= position_tolerance)
+        & (orientation_error <= orientation_tolerance)
+        & has_previous
+        & (position_step <= max_position_step)
+        & (orientation_step <= max_orientation_step)
+    )
+    counter = env._chess_pregrasp_hold_counter
+    counter[new_step & stable] += 1
+    counter[new_step & ~stable] = 0
+    previous_pose[new_step] = pose[new_step]
+    last_counted[new_step] = episode_step[new_step]
+    done = (counter >= stable_frames).float().unsqueeze(-1)
+    _debug_print_subtask(
+        env, signal_name, "pregrasp_align", float(position_error[0].item()), float(position_tolerance), unit="m"
+    )
+
+    failed = ~piece_ready | (valid & ~open_grip)
+    _mark_chess_failed(env, pending & failed)
+    return _subtask_gate(env, "pregrasp_align", done, max_steps=max_steps)
 
 
-def grasp_object_done(
+def grasp_done(
     env: ManagerBasedRLEnv,
     eef_link: str,
     object_name: str | None = None,
-    dist_threshold: float = 0.08,
     gripper_joint_pattern: str = "gripper",
-    gripper_closed_threshold: float = 0.110,
+    gripper_closed_threshold: float = 0.2,
+    gripper_stability_tolerance: float = 0.005,
+    stable_frames: int = 5,
+    position_tolerance: float = 0.008,
+    orientation_tolerance: float = 0.08,
+    max_position_step: float = 0.0015,
+    max_orientation_step: float = 0.03,
+    max_position_departure: float = 0.02,
+    max_orientation_departure: float = 0.20,
+    piece_dist_threshold: float = 0.08,
     piece_source_xy_threshold: float = 0.08,
     piece_source_z_threshold: float = 0.06,
     piece_max_tilt_deg: float = 30.0,
     max_steps: int = 300,
     signal_name: str | None = None,
 ) -> torch.Tensor:
-    """Latch a valid grasp; closing away from or disturbing the piece fails the attempt."""
-    eef = _eef_position(env, eef_link)
+    """Hold the demonstrated grasp pose until the closed gripper is stable."""
+    if stable_frames < 1:
+        raise ValueError("stable_frames must be at least one")
+
+    _ensure_pickup_state(env)
+    pose = _eef_pose_robot_root(env, eef_link)
+    target = env._chess_pregrasp_target_pose
+    position_error, orientation_error = _pose_error(pose, target)
+    target_valid = env._chess_pregrasp_target_valid
+
     if object_name is None:
         object_name = _get_active_piece_name(env)
     piece = env.scene[object_name]
     obj = piece.data.root_pos_w - env.scene.env_origins
+    eef = _eef_position(env, eef_link)
     source = _source_target_world(env, "source").unsqueeze(0).expand_as(obj)
-    dist = torch.norm(eef - obj, dim=-1)
-    grip = _gripper_joint_mean(env, gripper_joint_pattern)
-    near = dist <= dist_threshold
-    closed = grip <= gripper_closed_threshold
-    done = (near & closed).float().unsqueeze(-1)
-    _debug_print_subtask(env, signal_name, "grasp_object", float(dist[0].item()), float(dist_threshold), unit="m")
-
     piece_ready = _piece_on_square(
         obj, piece.data.root_quat_w, source, piece_source_xy_threshold, piece_source_z_threshold, piece_max_tilt_deg
     )
-    missed_grasp = closed & ~near
-    _mark_chess_failed(env, _is_stage_pending(env, "grasp_object") & (~piece_ready | missed_grasp))
+    near_piece = torch.linalg.vector_norm(eef - obj, dim=-1) <= piece_dist_threshold
 
-    return _subtask_gate(env, "grasp_object", done, max_steps=max_steps)
+    grip = _gripper_joint_mean(env, gripper_joint_pattern)
+    closed = grip <= gripper_closed_threshold
+    episode_step = env.episode_length_buf.to(device=env.device, dtype=torch.long)
+    last_counted = env._chess_grasp_last_counted_step
+    new_step = last_counted != episode_step
+    has_previous = last_counted >= 0
+    grip_stable = torch.abs(grip - env._chess_grasp_prev_grip) <= gripper_stability_tolerance
+    grip_stable &= has_previous
+    position_step, orientation_step = _pose_error(pose, env._chess_grasp_prev_pose)
+    pose_stable = (
+        has_previous
+        & (position_step <= max_position_step)
+        & (orientation_step <= max_orientation_step)
+    )
+    at_grasp_pose = (
+        target_valid
+        & (position_error <= position_tolerance)
+        & (orientation_error <= orientation_tolerance)
+    )
+    stable = closed & grip_stable & pose_stable & at_grasp_pose & near_piece & piece_ready
+    counter = env._chess_grasp_hold_counter
+    counter[new_step & stable] += 1
+    counter[new_step & ~stable] = 0
+    env._chess_grasp_prev_grip[new_step] = grip[new_step]
+    env._chess_grasp_prev_pose[new_step] = pose[new_step]
+    last_counted[new_step] = episode_step[new_step]
+    done = (counter >= stable_frames).float().unsqueeze(-1)
+    _debug_print_subtask(
+        env, signal_name, "grasp", float(grip[0].item()), float(gripper_closed_threshold), unit="rad"
+    )
+
+    pending = _is_stage_pending(env, "grasp")
+    departed = (position_error > max_position_departure) | (orientation_error > max_orientation_departure)
+    failed = ~piece_ready | (closed & (~near_piece | departed | ~target_valid))
+    _mark_chess_failed(env, pending & failed)
+    return _subtask_gate(env, "grasp", done, max_steps=max_steps)
+
+
+def grasp_object_done(*args, **kwargs) -> torch.Tensor:
+    """Backward-compatible function alias for the renamed grasp predicate."""
+    return grasp_done(*args, **kwargs)
 
 
 def lift_object_done(
@@ -395,9 +657,14 @@ def lift_object_done(
     translated_early = source_xy_distance > source_dist_threshold
     tipped = ~_piece_upright(piece.data.root_quat_w, piece_max_tilt_deg)
     failed = lost_grip | released | fell | translated_early | tipped
-    _mark_chess_failed(env, _is_stage_pending(env, "lift_object") & failed)
+    pending = _is_stage_pending(env, "lift_object")
+    _mark_chess_failed(env, pending & failed)
 
-    return _subtask_gate(env, "lift_object", done, max_steps=max_steps)
+    latched = _subtask_gate(env, "lift_object", done, max_steps=max_steps)
+    completed_env_ids = torch.nonzero(pending & done.squeeze(-1).bool(), as_tuple=False).flatten()
+    if completed_env_ids.numel() > 0:
+        clear_pickup_state(env, completed_env_ids)
+    return latched
 
 
 def move_over_destination_done(

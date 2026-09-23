@@ -21,12 +21,17 @@ exist on the task cfg.
 from isaaclab.envs.mimic_env_cfg import MimicEnvCfg, SubTaskConfig
 from isaaclab.utils import configclass
 
-from .so101_chess_cfg import So101ChessTaskCfg
+from .so101_chess_cfg import GRIPPER_OPEN_LIMIT, So101ChessTaskCfg
 
 
 @configclass
 class So101ChessMimicEnvCfg(So101ChessTaskCfg, MimicEnvCfg):
     """Mimic-enabled configuration for So101Chess."""
+
+    # Optional fixed calibration in the robot-root frame. This is never
+    # inferred from a trajectory minimum.
+    pickup_tcp_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    pickup_open_gripper_action: float = GRIPPER_OPEN_LIMIT
 
     def __post_init__(self):
         # Run both parents' post-inits first so all task scaffolding (scene,
@@ -77,10 +82,12 @@ class So101ChessMimicEnvCfg(So101ChessTaskCfg, MimicEnvCfg):
         #     ]
 
         self.subtask_configs["chess"] = [
+            # This approach segment keeps its existing global object-nearest
+            # selection and owns no part of the latched pickup episode.
             SubTaskConfig(
                 object_ref="active_piece",
                 subtask_term_signal="move_over_source",
-                subtask_term_offset_range=(5, 10),
+                subtask_term_offset_range=(0, 0),
                 selection_strategy="nearest_neighbor_object",
                 selection_strategy_kwargs={"nn_k": 3},
                 action_noise=0.003,
@@ -91,19 +98,44 @@ class So101ChessMimicEnvCfg(So101ChessTaskCfg, MimicEnvCfg):
                 interpolate_gripper_action=False,
                 apply_noise_during_interpolation=False,
                 # Existing demonstrations were recorded while the robot was
-                # still settling from the old all-zero reset.  Skip that
+                # still settling from the old all-zero reset. Skip that
                 # 20-frame transient now that reset starts at the demonstrated
                 # leader pose.
                 first_subtask_start_offset_range=(20, 20),
             ),
+            # Select once after reaching hover: filter by normalized geometry,
+            # then rank only that subset by object, EEF and robot state.
             SubTaskConfig(
                 object_ref="active_piece",
-                subtask_term_signal="grasp_object",
-                subtask_term_offset_range=(2, 5),
-                selection_strategy="nearest_neighbor_object",
-                selection_strategy_kwargs={"nn_k": 3},
+                subtask_term_signal="pregrasp_align",
+                subtask_term_offset_range=(0, 0),
+                selection_strategy="chess_type_filtered_pickup",
+                selection_strategy_kwargs={
+                    "piece_position_weight": 1.0,
+                    "object_rotation_weight": 0.05,
+                    "eef_position_weight": 1.0,
+                    "eef_rotation_weight": 0.05,
+                    "joint_position_weight": 0.02,
+                    "knight_yaw_weight": 0.1,
+                    "nn_k": 3,
+                },
                 action_noise=0.0,
                 num_interpolation_steps=5,
+                max_interpolation_translation_step=0.005,
+                max_interpolation_rotation_step=0.035,
+                num_fixed_steps=0,
+                interpolate_gripper_action=False,
+                apply_noise_during_interpolation=False,
+            ),
+            # These two stages read the source ID latched by pregrasp_align.
+            SubTaskConfig(
+                object_ref="active_piece",
+                subtask_term_signal="grasp",
+                subtask_term_offset_range=(0, 0),
+                selection_strategy="chess_latched_pickup",
+                selection_strategy_kwargs={},
+                action_noise=0.0,
+                num_interpolation_steps=1,
                 max_interpolation_translation_step=0.005,
                 max_interpolation_rotation_step=0.035,
                 num_fixed_steps=0,
@@ -113,10 +145,10 @@ class So101ChessMimicEnvCfg(So101ChessTaskCfg, MimicEnvCfg):
             SubTaskConfig(
                 object_ref="active_piece",
                 subtask_term_signal="lift_object",
-                subtask_term_offset_range=(0, 5),
-                selection_strategy="nearest_neighbor_object",
-                selection_strategy_kwargs={"nn_k": 3},
-                action_noise=0.003,
+                subtask_term_offset_range=(0, 0),
+                selection_strategy="chess_latched_pickup",
+                selection_strategy_kwargs={},
+                action_noise=0.0,
                 num_interpolation_steps=5,
                 max_interpolation_translation_step=0.005,
                 max_interpolation_rotation_step=0.035,

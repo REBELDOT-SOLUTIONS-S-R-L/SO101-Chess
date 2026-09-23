@@ -86,11 +86,13 @@ object-pose streams were added must be recorded again before synthetic-data
 generation; they do not contain enough information for multi-object neighbor
 selection.
 
-The ordered sequence includes `lift_after_place` between `place_object` and
-`return_home`. It requires the open gripper to retreat 5 cm upward with no
-more than 2 cm of horizontal drift while the piece remains on its destination
-square. Source demonstrations must include this signal before they can drive
-the seven-stage Mimic configuration.
+The ordered sequence is `move_over_source`, `pregrasp_align`, `grasp`,
+`lift_object`, `move_over_destination`, `place_object`, `lift_after_place`, then
+`return_home`. `pregrasp_align` records the stable open-gripper grasp pose.
+`lift_after_place` requires the open gripper to retreat 5 cm upward while the
+piece remains on its destination square. Source demonstrations must include all
+eight signals and an explicit per-episode `piece_type` attribute before they can
+drive this Mimic configuration.
 
 The task also customizes the standard dataset recorder for RebelHDF5:
 

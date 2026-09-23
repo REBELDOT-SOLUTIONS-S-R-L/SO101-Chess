@@ -54,7 +54,8 @@ JOINT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wri
 CAMERA_NAMES = ("top_camera", "right_wrist_camera")
 SUBTASK_STAGES = (
     "move_over_source",
-    "grasp_object",
+    "pregrasp_align",
+    "grasp",
     "lift_object",
     "move_over_destination",
     "place_object",

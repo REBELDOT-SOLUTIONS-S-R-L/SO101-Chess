@@ -87,11 +87,15 @@ import isaaclab_mimic.envs  # noqa: F401
 if args_cli.enable_pinocchio:
     import isaaclab_mimic.envs.pinocchio_envs  # noqa: F401
 
-from isaaclab_mimic.datagen.generation import env_loop, setup_async_generation, setup_env_config
+from isaaclab_mimic.datagen.generation import env_loop, run_data_generator, setup_env_config
 from isaaclab_mimic.datagen.utils import get_env_name_from_dataset, setup_output_paths
 
 import isaaclab_tasks  # noqa: F401
 import so101_chess.tasks  # noqa: F401
+from so101_chess.tasks.manager_based.so101_chess.pickup_datagen import (
+    ChessDataGenInfoPool,
+    ChessPickupDataGenerator,
+)
 from so101_chess.tasks.manager_based.so101_chess.recorders import ActivePieceInitialStateRecorder
 
 # import logger
@@ -127,6 +131,58 @@ class DestinationSquareInitialStateRecorder(ActivePieceInitialStateRecorder):
             ),
         }
         return key, initial_state
+
+
+def setup_chess_async_generation(
+    env,
+    num_envs: int,
+    input_file: str,
+    success_term,
+    pause_subtask: bool = False,
+    motion_planners=None,
+    failure_terms=None,
+):
+    """Create the standard async workers with chess pickup metadata and latching."""
+    event_loop = asyncio.get_event_loop()
+    reset_queue = asyncio.Queue()
+    action_queue = asyncio.Queue()
+    info_pool_lock = asyncio.Lock()
+    info_pool = ChessDataGenInfoPool(
+        env,
+        env.cfg,
+        env.device,
+        asyncio_lock=info_pool_lock,
+    )
+    info_pool.load_from_dataset_file(input_file)
+    print(f"Loaded {info_pool.num_datagen_infos} to chess datagen info pool")
+
+    data_generator = ChessPickupDataGenerator(env=env, src_demo_datagen_info_pool=info_pool)
+    tasks = []
+    for env_id in range(num_envs):
+        motion_planner = motion_planners[env_id] if motion_planners else None
+        tasks.append(
+            event_loop.create_task(
+                run_data_generator(
+                    env,
+                    env_id,
+                    reset_queue,
+                    action_queue,
+                    data_generator,
+                    success_term,
+                    pause_subtask=pause_subtask,
+                    motion_planner=motion_planner,
+                    failure_terms=failure_terms,
+                )
+            )
+        )
+
+    return {
+        "tasks": tasks,
+        "event_loop": event_loop,
+        "reset_queue": reset_queue,
+        "action_queue": action_queue,
+        "info_pool": info_pool,
+    }
 
 
 def main():
@@ -206,7 +262,7 @@ def main():
         env.cfg.datagen_config.use_skillgen = True
 
     # Setup and run async data generation
-    async_components = setup_async_generation(
+    async_components = setup_chess_async_generation(
         env=env,
         num_envs=args_cli.num_envs,
         input_file=args_cli.input_file,
