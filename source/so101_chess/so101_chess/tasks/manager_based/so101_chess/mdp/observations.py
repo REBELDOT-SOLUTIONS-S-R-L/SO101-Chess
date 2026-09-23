@@ -457,15 +457,21 @@ def pregrasp_align_done(
     max_position_step: float = 0.0015,
     max_orientation_step: float = 0.03,
     stable_frames: int = 5,
+    recording_piece_dist_threshold: float = 0.05,
+    recording_position_tolerance: float = 0.002,
+    recording_orientation_tolerance: float = 0.02,
+    recording_max_position_step: float = 0.00075,
+    recording_max_orientation_step: float = 0.01,
+    recording_stable_frames: int = 10,
     piece_source_xy_threshold: float = 0.05,
     piece_source_z_threshold: float = 0.03,
     piece_max_tilt_deg: float = 30.0,
     max_steps: int = 300,
     signal_name: str | None = None,
 ) -> torch.Tensor:
-    """Reach the selected demonstrated grasp pose with an open, stable gripper."""
-    if stable_frames < 1:
-        raise ValueError("stable_frames must be at least one")
+    """Capture a stable recording pose or reach the selected generation target with the gripper open."""
+    if stable_frames < 1 or recording_stable_frames < 1:
+        raise ValueError("stable frame requirements must be at least one")
 
     pose = _eef_pose_robot_root(env, eef_link)
     eef = _eef_position(env, eef_link)
@@ -483,16 +489,52 @@ def pregrasp_align_done(
     )
     grip = _gripper_joint_mean(env, gripper_joint_pattern)
     open_grip = grip >= gripper_open_threshold
-    near_piece = torch.linalg.vector_norm(eef - obj, dim=-1) <= piece_dist_threshold
-    pending = _is_stage_pending(env, "pregrasp_align")
-    candidate_ready = pending & piece_ready & open_grip & near_piece
-
     target = env._chess_pregrasp_target_pose
     valid = env._chess_pregrasp_target_valid
     external = env._chess_pregrasp_target_external
+
+    # Generation installs an external transformed demonstration target before
+    # this stage runs. During annotated recording there is no such target, so
+    # use stricter proximity and stability thresholds for capturing the
+    # operator's final open-gripper pose.
+    piece_distance_limit = torch.where(
+        external,
+        torch.full_like(grip, piece_dist_threshold),
+        torch.full_like(grip, recording_piece_dist_threshold),
+    )
+    position_limit = torch.where(
+        external,
+        torch.full_like(grip, position_tolerance),
+        torch.full_like(grip, recording_position_tolerance),
+    )
+    orientation_limit = torch.where(
+        external,
+        torch.full_like(grip, orientation_tolerance),
+        torch.full_like(grip, recording_orientation_tolerance),
+    )
+    position_step_limit = torch.where(
+        external,
+        torch.full_like(grip, max_position_step),
+        torch.full_like(grip, recording_max_position_step),
+    )
+    orientation_step_limit = torch.where(
+        external,
+        torch.full_like(grip, max_orientation_step),
+        torch.full_like(grip, recording_max_orientation_step),
+    )
+    required_stable_frames = torch.where(
+        external,
+        torch.full_like(env._chess_pregrasp_hold_counter, stable_frames),
+        torch.full_like(env._chess_pregrasp_hold_counter, recording_stable_frames),
+    )
+
+    near_piece = torch.linalg.vector_norm(eef - obj, dim=-1) <= piece_distance_limit
+    pending = _is_stage_pending(env, "pregrasp_align")
+    candidate_ready = pending & piece_ready & open_grip & near_piece
+
     position_error, orientation_error = _pose_error(pose, target)
     refresh_target = candidate_ready & ~external & (
-        ~valid | (position_error > position_tolerance) | (orientation_error > orientation_tolerance)
+        ~valid | (position_error > position_limit) | (orientation_error > orientation_limit)
     )
     target[refresh_target] = pose[refresh_target]
     valid[refresh_target] = True
@@ -508,20 +550,20 @@ def pregrasp_align_done(
     stable = (
         candidate_ready
         & valid
-        & (position_error <= position_tolerance)
-        & (orientation_error <= orientation_tolerance)
+        & (position_error <= position_limit)
+        & (orientation_error <= orientation_limit)
         & has_previous
-        & (position_step <= max_position_step)
-        & (orientation_step <= max_orientation_step)
+        & (position_step <= position_step_limit)
+        & (orientation_step <= orientation_step_limit)
     )
     counter = env._chess_pregrasp_hold_counter
     counter[new_step & stable] += 1
     counter[new_step & ~stable] = 0
     previous_pose[new_step] = pose[new_step]
     last_counted[new_step] = episode_step[new_step]
-    done = (counter >= stable_frames).float().unsqueeze(-1)
+    done = (counter >= required_stable_frames).float().unsqueeze(-1)
     _debug_print_subtask(
-        env, signal_name, "pregrasp_align", float(position_error[0].item()), float(position_tolerance), unit="m"
+        env, signal_name, "pregrasp_align", float(position_error[0].item()), float(position_limit[0].item()), unit="m"
     )
 
     failed = ~piece_ready | (valid & ~open_grip)

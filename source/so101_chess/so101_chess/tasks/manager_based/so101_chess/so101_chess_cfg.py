@@ -646,9 +646,17 @@ class So101ChessObservationsCfg:
                 "piece_dist_threshold": 0.08,
                 "position_tolerance": 0.005,
                 "orientation_tolerance": 0.05,
+                # Generation compares against its transformed source target.
                 "max_position_step": 0.0015,
                 "max_orientation_step": 0.03,
                 "stable_frames": 5,
+                # Annotated recording captures the operator's final open pose.
+                "recording_piece_dist_threshold": 0.05,
+                "recording_position_tolerance": 0.002,
+                "recording_orientation_tolerance": 0.02,
+                "recording_max_position_step": 0.00075,
+                "recording_max_orientation_step": 0.01,
+                "recording_stable_frames": 10,
                 "piece_source_xy_threshold": 0.05,
                 "piece_source_z_threshold": 0.03,
                 "piece_max_tilt_deg": 30.0,

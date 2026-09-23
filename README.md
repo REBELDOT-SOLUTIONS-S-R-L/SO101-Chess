@@ -88,7 +88,8 @@ selection.
 
 The ordered sequence is `move_over_source`, `pregrasp_align`, `grasp`,
 `lift_object`, `move_over_destination`, `place_object`, `lift_after_place`, then
-`return_home`. `pregrasp_align` records the stable open-gripper grasp pose.
+`return_home`. `pregrasp_align` records the open-gripper grasp pose only
+after the EEF stays within 5 cm of the piece for 10 stable control frames.
 `lift_after_place` requires the open gripper to retreat 5 cm upward while the
 piece remains on its destination square. Source demonstrations must include all
 eight signals and an explicit per-episode `piece_type` attribute before they can
