@@ -14,9 +14,15 @@ import torch
 from isaaclab_mimic.datagen.data_generator import DataGenerator
 from isaaclab_mimic.datagen.datagen_info_pool import DataGenInfoPool
 
-# Importing registers both strategies with IsaacLab Mimic.
+# Importing registers the chess-specific strategies with IsaacLab Mimic.
 from . import pickup_selection as _pickup_selection  # noqa: F401
 from .piece_types import normalize_piece_type
+from .pickup_trajectory import (
+    MeasuredCompletionWaypointList,
+    adjust_pickup_waypoint_poses,
+    clamp_pickup_waypoint_z,
+    move_trailing_closing_commands_to_grasp,
+)
 
 
 class ChessDataGenInfoPool(DataGenInfoPool):
@@ -26,6 +32,7 @@ class ChessDataGenInfoPool(DataGenInfoPool):
         super().__init__(*args, **kwargs)
         self.piece_types: list[str] = []
         self.robot_joint_positions: list[torch.Tensor] = []
+        self.excluded_pickup_demo_indices: frozenset[int] = frozenset()
         self._loading_dataset_file = False
 
     def load_from_dataset_file(self, file_path, select_demo_keys: str | None = None):
@@ -35,9 +42,33 @@ class ChessDataGenInfoPool(DataGenInfoPool):
         finally:
             self._loading_dataset_file = False
 
-        source_piece_types = frozenset(self.piece_types)
+        excluded_specs = tuple(getattr(self.env_cfg, "pickup_excluded_sources", ()))
+        excluded_indices: set[int] = set()
+        for demo_index, expected_piece_type in excluded_specs:
+            demo_index = int(demo_index)
+            if demo_index < 0 or demo_index >= len(self.piece_types):
+                raise IndexError(
+                    f"Excluded pickup source {demo_index} is outside the "
+                    f"{len(self.piece_types)}-episode source dataset"
+                )
+            actual_piece_type = normalize_piece_type(self.piece_types[demo_index])
+            expected_piece_type = normalize_piece_type(expected_piece_type)
+            if actual_piece_type != expected_piece_type:
+                raise ValueError(
+                    f"Excluded pickup source {demo_index} was expected to be "
+                    f"{expected_piece_type!r}, but the loaded dataset contains {actual_piece_type!r}. "
+                    "Update pickup_excluded_sources for this source dataset."
+                )
+            excluded_indices.add(demo_index)
+        self.excluded_pickup_demo_indices = frozenset(excluded_indices)
+
+        source_piece_types = frozenset(
+            piece_type
+            for demo_index, piece_type in enumerate(self.piece_types)
+            if demo_index not in self.excluded_pickup_demo_indices
+        )
         if not source_piece_types:
-            raise ValueError("The source dataset contains no pickup piece types")
+            raise ValueError("The source dataset contains no usable pickup piece types after exclusions")
         # The next generation reset must sample only types for which strict
         # type-filtered pickup has at least one source demonstration.
         self.env._chess_pickup_source_piece_types = source_piece_types
@@ -74,14 +105,33 @@ class ChessDataGenInfoPool(DataGenInfoPool):
         super()._add_episode(episode)
         if len(self.datagen_infos) != previous_count + 1:
             raise RuntimeError("DataGenInfo pool did not append exactly one source demonstration")
+
+        for eef_name, signal_names in self.subtask_term_signal_names.items():
+            if "pregrasp_align" not in signal_names or "grasp" not in signal_names:
+                continue
+            pregrasp_index = signal_names.index("pregrasp_align")
+            grasp_index = signal_names.index("grasp")
+            pregrasp_term = self.env_cfg.observations.subtask_terms.pregrasp_align
+            open_threshold = float(pregrasp_term.params["gripper_open_threshold"])
+            episode_boundaries = self._subtask_boundaries[eef_name][-1]
+            gripper_actions = self.datagen_infos[-1].gripper_action[eef_name]
+            self._subtask_boundaries[eef_name][-1] = move_trailing_closing_commands_to_grasp(
+                boundaries=episode_boundaries,
+                gripper_actions=gripper_actions,
+                pregrasp_index=pregrasp_index,
+                grasp_index=grasp_index,
+                open_threshold=open_threshold,
+            )
+
         self.piece_types.append(piece_type)
         self.robot_joint_positions.append(joint_positions)
 
 
 class ChessPickupDataGenerator(DataGenerator):
-    """Add type-filtered pickup ownership while retaining standard destination selection."""
+    """Add type-filtered source selection and latched pickup ownership."""
 
     _PICKUP_SUBTASKS = {"pregrasp_align", "grasp", "lift_object"}
+    _MEASURED_COMPLETION_SUBTASKS = {"pregrasp_align", "grasp"}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -107,6 +157,15 @@ class ChessPickupDataGenerator(DataGenerator):
             raise RuntimeError("Chess pickup selection was called without an active environment context")
 
         env_id = int(context["env_id"])
+        if selection_strategy_name in {
+            "chess_type_filtered_pickup",
+            "chess_type_filtered_multi_object",
+        }:
+            kwargs.update(
+                current_piece_type=normalize_piece_type(getattr(self.env, "active_piece_name")),
+                source_piece_types=self.src_demo_datagen_info_pool.piece_types,
+            )
+
         if selection_strategy_name == "chess_type_filtered_pickup":
             robot = self.env.scene["robot"]
             gripper_joint_indices, _ = robot.find_joints("gripper")
@@ -125,10 +184,9 @@ class ChessPickupDataGenerator(DataGenerator):
                     ]
                 )
             kwargs.update(
-                current_piece_type=normalize_piece_type(getattr(self.env, "active_piece_name")),
-                source_piece_types=self.src_demo_datagen_info_pool.piece_types,
                 current_joint_positions=robot.data.joint_pos[env_id, arm_joint_indices],
                 source_joint_positions=source_joints,
+                excluded_demo_indices=self.src_demo_datagen_info_pool.excluded_pickup_demo_indices,
             )
         elif selection_strategy_name == "chess_latched_pickup":
             from .mdp.observations import get_pickup_source_demo_id
@@ -145,6 +203,42 @@ class ChessPickupDataGenerator(DataGenerator):
             selection_strategy_kwargs=kwargs,
             all_object_poses=all_object_poses,
             source_demo_selections=source_demo_selections,
+        )
+
+    def _subtask_signal_latched(self, env_id: int, signal_name: str) -> bool:
+        signals = self.env.get_subtask_term_signals(env_ids=[env_id])
+        if signal_name not in signals:
+            raise KeyError(f"Missing measured subtask signal {signal_name!r}")
+        signal = torch.as_tensor(signals[signal_name]).reshape(-1)
+        if signal.numel() != 1:
+            raise RuntimeError(
+                f"Expected one {signal_name!r} value for env {env_id}, got shape "
+                f"{tuple(signal.shape)}"
+            )
+        return bool(signal[0].item())
+
+    def merge_eef_subtask_trajectory(
+        self,
+        env_id: int,
+        eef_name: str,
+        subtask_index: int,
+        prev_executed_traj,
+        subtask_trajectory,
+    ):
+        waypoints = super().merge_eef_subtask_trajectory(
+            env_id=env_id,
+            eef_name=eef_name,
+            subtask_index=subtask_index,
+            prev_executed_traj=prev_executed_traj,
+            subtask_trajectory=subtask_trajectory,
+        )
+        signal_name = self.env_cfg.subtask_configs[eef_name][subtask_index].subtask_term_signal
+        if signal_name not in self._MEASURED_COMPLETION_SUBTASKS:
+            return waypoints
+
+        return MeasuredCompletionWaypointList(
+            waypoints,
+            completion_predicate=lambda: self._subtask_signal_latched(int(env_id), signal_name),
         )
 
     def generate_eef_subtask_trajectory(
@@ -181,9 +275,17 @@ class ChessPickupDataGenerator(DataGenerator):
             device=trajectory[0].pose.device,
         )
         if bool(torch.any(fixed_offset != 0).item()):
-            for sequence in trajectory.waypoint_sequences:
-                for waypoint in sequence.sequence:
-                    waypoint.pose[:3, 3] += fixed_offset
+            adjust_pickup_waypoint_poses(trajectory, fixed_offset=fixed_offset)
+
+        active_piece_pose = self.env.get_object_poses(env_ids=[int(env_id)]).get("active_piece")
+        if active_piece_pose is None or active_piece_pose.shape != (1, 4, 4):
+            actual_shape = None if active_piece_pose is None else tuple(active_piece_pose.shape)
+            raise RuntimeError(
+                "Pickup Z clamping requires one active-piece pose with shape (1, 4, 4); "
+                f"got {actual_shape}"
+            )
+        minimum_z = active_piece_pose[0, 2, 3] + float(self.env_cfg.pickup_min_tcp_clearance)
+        clamp_pickup_waypoint_z(trajectory, minimum_z)
 
         from .mdp.observations import (
             get_pickup_source_demo_id,
@@ -194,10 +296,6 @@ class ChessPickupDataGenerator(DataGenerator):
         selected_demo_id = int(selected_src_demo_inds[eef_name])
         if signal_name == "pregrasp_align":
             set_pickup_source_demo_id(self.env, int(env_id), selected_demo_id)
-            open_action = float(self.env_cfg.pickup_open_gripper_action)
-            for sequence in trajectory.waypoint_sequences:
-                for waypoint in sequence.sequence:
-                    waypoint.gripper_action = torch.full_like(waypoint.gripper_action, open_action)
             set_pregrasp_target_pose(self.env, int(env_id), trajectory.last_waypoint.pose)
             return trajectory
 
@@ -210,8 +308,6 @@ class ChessPickupDataGenerator(DataGenerator):
 
         if signal_name == "grasp":
             target_pose = self.env._chess_pregrasp_target_pose[int(env_id)].clone()
-            for sequence in trajectory.waypoint_sequences:
-                for waypoint in sequence.sequence:
-                    waypoint.pose = target_pose.clone()
+            adjust_pickup_waypoint_poses(trajectory, held_pose=target_pose)
 
         return trajectory

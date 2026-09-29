@@ -50,6 +50,33 @@ parser.add_argument(
     default="legacy",
     help="Dataset schema to use for the generated output file.",
 )
+parser.add_argument(
+    "--failed_config_file",
+    type=str,
+    default=None,
+    help=(
+        "Optional generated-failure HDF5. When set, generation replays unique source/target "
+        "configurations for --failed_piece_type instead of sampling ordinary random moves."
+    ),
+)
+parser.add_argument(
+    "--failed_piece_type",
+    choices=("pawn", "rook", "knight", "bishop", "queen", "king"),
+    default="knight",
+    help="Piece type selected from --failed_config_file.",
+)
+parser.add_argument(
+    "--failed_config_limit",
+    type=int,
+    default=0,
+    help="Maximum unique failed configurations to replay; zero uses all of them.",
+)
+parser.add_argument(
+    "--failed_config_seed",
+    type=int,
+    default=0,
+    help="Seed used to shuffle the unique failed configurations before applying the limit.",
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -72,8 +99,10 @@ import inspect
 import logging
 import random
 from collections.abc import Sequence
+from pathlib import Path
 
 import gymnasium as gym
+import h5py
 import numpy as np
 import torch
 
@@ -96,10 +125,121 @@ from so101_chess.tasks.manager_based.so101_chess.pickup_datagen import (
     ChessDataGenInfoPool,
     ChessPickupDataGenerator,
 )
+from so101_chess.tasks.manager_based.so101_chess.mdp import events as chess_events
+from so101_chess.tasks.manager_based.so101_chess.piece_types import normalize_piece_type
 from so101_chess.tasks.manager_based.so101_chess.recorders import ActivePieceInitialStateRecorder
 
 # import logger
 logger = logging.getLogger(__name__)
+
+_FAILED_CONFIG_MOVES: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
+_FAILED_CONFIG_INDEX = 0
+
+
+def _episode_piece_type(episode: h5py.Group) -> str:
+    """Return one normalized per-episode piece type from an HDF5 attribute."""
+    value = episode.attrs.get("piece_type", "")
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    return normalize_piece_type(str(value))
+
+
+def _cluster_axis(values: list[float], tolerance: float = 0.01) -> np.ndarray:
+    """Cluster recorded square coordinates into the board's eight axis centers."""
+    groups: list[list[float]] = []
+    for value in sorted(values):
+        if not groups or value - groups[-1][-1] > tolerance:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    centers = np.asarray([sum(group) / len(group) for group in groups], dtype=np.float64)
+    if len(centers) != 8:
+        raise ValueError(f"Expected eight chessboard coordinate centers, found {len(centers)}: {centers}")
+    return centers
+
+
+def _load_failed_config_moves(
+    dataset_path: str,
+    piece_type: str,
+    limit: int,
+    seed: int,
+) -> list[tuple[str, tuple[int, int], tuple[int, int]]]:
+    """Load unique failed source/target pairs and convert recorded XY to board squares."""
+    path = Path(dataset_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Failed-configuration dataset does not exist: {path}")
+    if limit < 0:
+        raise ValueError("--failed_config_limit must be non-negative")
+
+    with h5py.File(path, "r") as dataset:
+        if "data" not in dataset:
+            raise ValueError(f"Failed-configuration dataset has no /data group: {path}")
+        data = dataset["data"]
+        selected = [
+            data[name]
+            for name in data
+            if _episode_piece_type(data[name]) == piece_type
+        ]
+        if not selected:
+            raise ValueError(f"No failed {piece_type!r} episodes found in {path}")
+
+        x_values: list[float] = []
+        y_values: list[float] = []
+        for episode in data.values():
+            for object_name in ("active_piece", "destination_square"):
+                pose = np.asarray(
+                    episode[f"initial_state/rigid_objects/{object_name}/initial_pose"][0]
+                )
+                x_values.append(float(pose[0, 3]))
+                y_values.append(float(pose[1, 3]))
+        x_centers = _cluster_axis(x_values)
+        y_centers = _cluster_axis(y_values)
+
+        unique_squares: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+        for episode in selected:
+            squares = []
+            for object_name in ("active_piece", "destination_square"):
+                pose = np.asarray(
+                    episode[f"initial_state/rigid_objects/{object_name}/initial_pose"][0]
+                )
+                # Authored board transforms map X to column and Y to row.
+                column = int(np.argmin(np.abs(x_centers - float(pose[0, 3]))))
+                row = int(np.argmin(np.abs(y_centers - float(pose[1, 3]))))
+                squares.append((row, column))
+            unique_squares.add((squares[0], squares[1]))
+
+    ordered_squares = sorted(unique_squares)
+    random.Random(seed).shuffle(ordered_squares)
+    if limit:
+        ordered_squares = ordered_squares[:limit]
+
+    moves = []
+    for index, (source, target) in enumerate(ordered_squares):
+        compatible_names = [
+            name
+            for name in chess_events._DEFAULT_CHESS_PIECES
+            if normalize_piece_type(name) == piece_type
+            and target in chess_events.get_valid_chess_targets(name, source)
+        ]
+        if not compatible_names:
+            raise ValueError(f"Recorded move is not legal for {piece_type}: {source} -> {target}")
+        piece_name = compatible_names[index % len(compatible_names)]
+        moves.append((piece_name, source, target))
+    return moves
+
+
+def _sample_failed_config_move(**_kwargs) -> tuple[str, tuple[int, int], tuple[int, int]]:
+    """Return the next failed configuration, cycling only if trials exceed the manifest."""
+    global _FAILED_CONFIG_INDEX
+    if not _FAILED_CONFIG_MOVES:
+        raise RuntimeError("The failed-configuration move list is empty")
+    move = _FAILED_CONFIG_MOVES[_FAILED_CONFIG_INDEX % len(_FAILED_CONFIG_MOVES)]
+    _FAILED_CONFIG_INDEX += 1
+    print(
+        f"[FAILED CONFIG] index={_FAILED_CONFIG_INDEX - 1} piece={move[0]} "
+        f"source={move[1]} target={move[2]}"
+    )
+    return move
 
 
 class DestinationSquareInitialStateRecorder(ActivePieceInitialStateRecorder):
@@ -190,7 +330,23 @@ def setup_chess_async_generation(
 
 
 def main():
+    global _FAILED_CONFIG_INDEX, _FAILED_CONFIG_MOVES
     num_envs = args_cli.num_envs
+
+    if args_cli.failed_config_file is not None:
+        if num_envs != 1:
+            raise ValueError("Failed-configuration replay currently requires --num_envs 1")
+        _FAILED_CONFIG_MOVES = _load_failed_config_moves(
+            args_cli.failed_config_file,
+            args_cli.failed_piece_type,
+            args_cli.failed_config_limit,
+            args_cli.failed_config_seed,
+        )
+        chess_events.sample_chess_move_type_balanced_random = _sample_failed_config_move
+        print(
+            f"Loaded {len(_FAILED_CONFIG_MOVES)} unique failed {args_cli.failed_piece_type} "
+            "source/target configurations."
+        )
 
     # Setup output paths and get env name
     output_dir, output_file_name = setup_output_paths(args_cli.output_file)
@@ -210,6 +366,10 @@ def main():
         generation_num_trials=args_cli.generation_num_trials,
         recorder_cfg=recorder_cfg,
     )
+    if args_cli.failed_config_file is not None:
+        # A replay test should stop after the requested number of attempts, not
+        # wait until it accumulates that many successful outputs.
+        env_cfg.datagen_config.generation_guarantee = False
     if recorder_cfg is not None and hasattr(env_cfg.events, "reset_sobol_chess_move"):
         # The chess environment normally installs its active-piece recorder.
         # A generic RecorderTermCfg keeps this local extension in place while
@@ -236,6 +396,12 @@ def main():
 
     # Reset before starting
     env.reset()
+    if args_cli.failed_config_file is not None:
+        # The setup reset above consumes one sampler entry. Generation performs
+        # its own reset for every attempt, so rewind both the replay queue and
+        # the task reset cache before the first real trial.
+        _FAILED_CONFIG_INDEX = 0
+        env._chess_move_reset_state = {"count": 0}
 
     motion_planners = None
     if args_cli.use_skillgen:

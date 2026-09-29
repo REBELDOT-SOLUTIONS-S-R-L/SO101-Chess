@@ -20,7 +20,7 @@ import omni.usd
 import torch
 from pxr import Gf, PhysicsSchemaTools, Sdf, UsdShade
 
-from ..piece_types import normalize_piece_type
+from ..piece_types import PIECE_TYPES, normalize_piece_type
 from .board import square_surface_position
 
 if TYPE_CHECKING:
@@ -216,6 +216,44 @@ def sample_chess_move_random(
     return valid_moves[move_index]
 
 
+def sample_chess_move_type_balanced_random(
+    piece_names: list[str] | tuple[str, ...] | None = None,
+    board_size: int = 8,
+    available_piece_names: list[str] | tuple[str, ...] | None = None,
+    type_index: int | None = None,
+) -> tuple[str, tuple[int, int], tuple[int, int]]:
+    """Sample a legal move after selecting its normalized piece type uniformly.
+
+    When ``type_index`` is supplied, the available types are selected cyclically
+    instead of randomly. The reset event drives this index from its successful
+    episode count. The physical piece color and legal move remain random within
+    the selected type.
+    """
+    candidate_pieces = list(piece_names) if piece_names else list(_DEFAULT_CHESS_PIECES)
+    if available_piece_names is not None:
+        candidate_pieces = [name for name in candidate_pieces if name in available_piece_names]
+    if not candidate_pieces:
+        raise ValueError("piece_names must contain at least one available chess piece name")
+
+    available_types = [
+        piece_type
+        for piece_type in PIECE_TYPES
+        if any(normalize_piece_type(name) == piece_type for name in candidate_pieces)
+    ]
+    if type_index is None:
+        selected_type_index = int(torch.randint(len(available_types), (1,), dtype=torch.int64).item())
+    else:
+        selected_type_index = int(type_index) % len(available_types)
+    selected_type = available_types[selected_type_index]
+    selected_pieces = [
+        name for name in candidate_pieces if normalize_piece_type(name) == selected_type
+    ]
+
+    valid_moves = _enumerate_valid_chess_moves(selected_pieces, board_size, available_piece_names)
+    move_index = int(torch.randint(len(valid_moves), (1,), dtype=torch.int64).item())
+    return valid_moves[move_index]
+
+
 def _enumerate_valid_chess_moves(
     piece_names: list[str] | tuple[str, ...] | None,
     board_size: int,
@@ -316,8 +354,10 @@ def sample_chess_move_reset(
     move until either the task's success termination fires or the recorder's
     successful-export counter increases. This lets an operator discard and
     retry a demonstration without consuming another move. ``sampling_strategy``
-    accepts ``"sobol"`` for coverage-oriented recording or ``"random"`` for
-    ordinary generation-time randomization.
+    accepts ``"sobol"`` for coverage-oriented recording, ``"random"`` for
+    move-uniform randomization, or ``"type_balanced_random"`` for random legal
+    moves whose piece-type cycle advances after each successful episode. Failed
+    type-balanced attempts sample a fresh move of the same type.
     """
     if not 1 <= min_pieces <= max_pieces <= len(_DEFAULT_CHESS_PIECES):
         raise ValueError("piece count must satisfy 1 <= min_pieces <= max_pieces <= 12")
@@ -392,6 +432,12 @@ def sample_chess_move_reset(
         )
         state["last_exported_successful_episode_count"] = successful_export_count
 
+    if sampling_strategy == "type_balanced_random":
+        balanced_success_count = int(state.get("balanced_success_count", 0))
+        if episode_succeeded:
+            balanced_success_count += 1
+        state["balanced_success_count"] = balanced_success_count
+
     should_advance = (
         not advance_on_success_only
         or state.get("move") is None
@@ -412,10 +458,17 @@ def sample_chess_move_reset(
                 board_size=board_size,
                 available_piece_names=available_piece_names,
             )
+        elif sampling_strategy == "type_balanced_random":
+            state["move"] = sample_chess_move_type_balanced_random(
+                piece_names=piece_names,
+                board_size=board_size,
+                available_piece_names=available_piece_names,
+                type_index=int(seed) + int(state["balanced_success_count"]),
+            )
         else:
             raise ValueError(
                 f"Unsupported chess move sampling strategy: {sampling_strategy!r}. "
-                "Expected 'sobol' or 'random'."
+                "Expected 'sobol', 'random', or 'type_balanced_random'."
             )
         state["count"] += 1
 

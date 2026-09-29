@@ -21,7 +21,7 @@ from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
 
 
 DEFAULT_CHECKPOINT = Path(
-    "/home/roboticslab/finetuned-models/xvla-chess-500ep-lr5e-5/checkpoints/120000/pretrained_model"
+    "/home/roboticslab/finetuned-models/xvla-chess-balanced-lowpoly-2-lr1e-4/checkpoints/120000/pretrained_model"
 )
 
 
@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--seed", type=int, default=0, help="Seed XVLA's stochastic action-chunk sampler.")
     return parser.parse_args()
 
 
@@ -90,6 +91,12 @@ def main() -> None:
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("This bridge is local only; bind to 127.0.0.1")
     inference = Inference(args.checkpoint, args.device)
+    # Seed after model construction so every checkpoint sweep starts inference
+    # from the same sampling state regardless of weight-loading internals.
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -124,7 +131,16 @@ def main() -> None:
             self.wfile.write(body)
 
     address = (args.host, args.port)
-    print(json.dumps({"listening": f"http://{args.host}:{args.port}", "checkpoint": str(args.checkpoint)}), flush=True)
+    print(
+        json.dumps(
+            {
+                "listening": f"http://{args.host}:{args.port}",
+                "checkpoint": str(args.checkpoint),
+                "seed": args.seed,
+            }
+        ),
+        flush=True,
+    )
     try:
         HTTPServer(address, Handler).serve_forever()
     except KeyboardInterrupt:

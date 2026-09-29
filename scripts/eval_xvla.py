@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import multiprocessing
+import os
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +33,17 @@ parser.add_argument("--reset_camera_renders", type=int, default=60, help="Extra 
 parser.add_argument("--request_timeout", type=float, default=120.0)
 parser.add_argument("--debug_steps", type=int, default=0, help="Print policy, applied target, and measured joints for N steps.")
 parser.add_argument("--debug_observation", type=Path, default=None, help="Save the first live observation and action chunk as NPZ.")
+parser.add_argument(
+    "--log_file",
+    type=Path,
+    default=None,
+    help="Append run and per-episode records as JSON Lines, syncing each finished episode to disk.",
+)
+parser.add_argument(
+    "--checkpoint_label",
+    default=None,
+    help="Checkpoint identifier stored in --log_file records (the policy is still served by --policy_url).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 if not args.enable_cameras:
@@ -48,20 +62,48 @@ import torch
 from isaaclab_tasks.utils import parse_env_cfg
 
 import so101_chess.tasks  # noqa: F401
+from so101_chess.tasks.manager_based.so101_chess import mdp
 
 
 JOINT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
 CAMERA_NAMES = ("top_camera", "right_wrist_camera")
-SUBTASK_STAGES = (
-    "move_over_source",
-    "pregrasp_align",
-    "grasp",
-    "lift_object",
-    "move_over_destination",
-    "place_object",
-    "lift_after_place",
-    "return_home",
-)
+
+
+class JsonlRunLogger:
+    """Append durable, machine-readable evaluation records."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path.expanduser().resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._stream = self.path.open("a", encoding="utf-8")
+
+    def write(self, record: dict, *, sync: bool = False) -> None:
+        payload = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            **record,
+        }
+        self._stream.write(json.dumps(payload, sort_keys=True) + "\n")
+        self._stream.flush()
+        if sync:
+            os.fsync(self._stream.fileno())
+
+    def close(self) -> None:
+        self._stream.close()
+
+
+def current_chess_move(env) -> dict[str, object]:
+    """Return the reset move currently assigned to the single evaluation env."""
+    state = getattr(env, "_chess_move_reset_state", None)
+    move = state.get("move") if isinstance(state, dict) else None
+    if not isinstance(move, (tuple, list)) or len(move) != 3:
+        return {}
+    piece_name, source_square, target_square = move
+    return {
+        "piece_name": str(piece_name),
+        "piece_type": str(piece_name).split("_", maxsplit=1)[0],
+        "source_square": [int(value) for value in source_square],
+        "target_square": [int(value) for value in target_square],
+    }
 
 
 def refresh_reset_cameras(env) -> None:
@@ -102,22 +144,57 @@ def infer(env, joint_ids: list[int], save_observation: Path | None = None) -> np
 
 
 def main() -> None:
-    env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=1)
-    env_cfg.use_teleop_device("so101leader")
-    # The training data stores final joint targets in radians. The leader-only
-    # wrist calibration must not be added a second time during policy rollout.
-    env_cfg.actions.arm_action.offset = 0.0
-    env_cfg.recorders = None
-    # The generated training demonstrations used random moves and did not
-    # repeat a failed move. The base teleop task uses success-gated Sobol draws.
-    env_cfg.events.reset_sobol_chess_move.params["sampling_strategy"] = "random"
-    env_cfg.events.reset_sobol_chess_move.params["advance_on_success_only"] = False
-    if args.episode_length_s is not None:
-        env_cfg.episode_length_s = args.episode_length_s
-    if args.seed is not None:
-        env_cfg.seed = args.seed
-    env = gym.make(args.task, cfg=env_cfg).unwrapped
+    run_logger = JsonlRunLogger(args.log_file) if args.log_file is not None else None
+    env = None
+    completed = successes = 0
     try:
+        if run_logger is not None:
+            run_logger.write(
+                {
+                    "event": "run_start",
+                    "checkpoint": args.checkpoint_label,
+                    "task": args.task,
+                    "instruction": args.instruction,
+                    "policy_url": args.policy_url,
+                    "requested_episodes": args.episodes,
+                    "episode_length_s": args.episode_length_s,
+                    "action_horizon": args.action_horizon,
+                    "seed": args.seed,
+                },
+                sync=True,
+            )
+            print(f"Writing episode records to {run_logger.path}", flush=True)
+
+        env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=1)
+        env_cfg.use_teleop_device("so101leader")
+        # The training data stores final joint targets in radians. The leader-only
+        # wrist calibration must not be added a second time during policy rollout.
+        env_cfg.actions.arm_action.offset = 0.0
+        env_cfg.recorders = None
+        # Policy evaluation is outcome-only. Do not compute the Mimic subtask
+        # predicates, do not terminate on their failure latch, and do not require
+        # the sequential subtask stage (or a closed gripper) for final success.
+        env_cfg.observations.subtask_terms = None
+        env_cfg.terminations.failed = None
+        env_cfg.terminations.success.func = mdp.chess_move_final_success
+        env_cfg.terminations.success.params = {
+            "target_xy_threshold": 0.02,
+            "target_z_threshold": 0.02,
+            "max_tilt_deg": 5.0,
+            "home_eef_link": "gripper_frame_link",
+            "home_pos": (0.05, -0.12, 0.0135),
+            "home_threshold": (0.04, 0.04, 0.03),
+            "min_hold_steps": 5,
+        }
+        # The generated training demonstrations used random moves and did not
+        # repeat a failed move. The base teleop task uses success-gated Sobol draws.
+        env_cfg.events.reset_sobol_chess_move.params["sampling_strategy"] = "random"
+        env_cfg.events.reset_sobol_chess_move.params["advance_on_success_only"] = False
+        if args.episode_length_s is not None:
+            env_cfg.episode_length_s = args.episode_length_s
+        if args.seed is not None:
+            env_cfg.seed = args.seed
+        env = gym.make(args.task, cfg=env_cfg).unwrapped
         robot = env.scene["robot"]
         joint_ids, found_names = robot.find_joints(list(JOINT_NAMES), preserve_order=True)
         if tuple(found_names) != JOINT_NAMES or env.action_manager.total_action_dim != 6:
@@ -126,12 +203,11 @@ def main() -> None:
         env.reset()
         refresh_reset_cameras(env)
         print("Isaac chess environment ready; requesting XVLA actions.", flush=True)
-        completed = successes = 0
         step_count = 0
         episode_steps = 0
+        episode_move = current_chess_move(env)
         episode_start = robot.data.joint_pos[0, joint_ids].detach().cpu().numpy().copy()
         max_arm_excursion = 0.0
-        max_stage = 0
         while simulation_app.is_running() and completed < args.episodes:
             save_observation = args.debug_observation if step_count == 0 else None
             chunk = infer(env, joint_ids, save_observation)
@@ -152,9 +228,6 @@ def main() -> None:
                     max_arm_excursion = max(
                         max_arm_excursion, float(np.linalg.norm(actual[:5] - episode_start[:5]))
                     )
-                    stage = getattr(env, "_chess_subtask_stage", None)
-                    if stage is not None:
-                        max_stage = max(max_stage, int(stage[0]))
                 if step_count < args.debug_steps:
                     processed = np.concatenate(
                         [
@@ -172,26 +245,76 @@ def main() -> None:
                 episode_steps += 1
                 if terminated[0] or timed_out[0]:
                     success = bool(env.termination_manager.get_term("success")[0])
-                    failed = bool(env.termination_manager.get_term("failed")[0])
-                    result = "success" if success else "failed" if failed else "timed out"
+                    result = "success" if success else "timed out"
                     successes += int(success)
                     completed += 1
                     print(
                         f"Episode {completed}: {result} after {episode_steps} steps; "
                         f"max arm excursion {max_arm_excursion:.2f} rad; "
-                        f"next subtask {SUBTASK_STAGES[max_stage] if max_stage < len(SUBTASK_STAGES) else 'all complete'}; "
                         f"{successes} successes",
                         flush=True,
                     )
+                    if run_logger is not None:
+                        run_logger.write(
+                            {
+                                "event": "episode",
+                                "checkpoint": args.checkpoint_label,
+                                "episode": completed,
+                                "success": success,
+                                "result": result,
+                                "terminated": bool(terminated[0]),
+                                "timed_out": bool(timed_out[0]),
+                                "episode_steps": episode_steps,
+                                "simulated_duration_s": episode_steps * float(env.step_dt),
+                                "global_steps": step_count,
+                                "max_arm_excursion_rad": max_arm_excursion,
+                                "cumulative_successes": successes,
+                                "cumulative_success_rate": successes / completed,
+                                **episode_move,
+                            },
+                            sync=True,
+                        )
                     episode_start = actual.copy()
                     max_arm_excursion = 0.0
-                    max_stage = 0
                     episode_steps = 0
                     if completed < args.episodes:
                         refresh_reset_cameras(env)
+                        episode_move = current_chess_move(env)
                     break
+        if completed != args.episodes:
+            raise RuntimeError(
+                f"Evaluation stopped after {completed}/{args.episodes} episodes before completing the run"
+            )
+        if run_logger is not None:
+            run_logger.write(
+                {
+                    "event": "run_complete",
+                    "checkpoint": args.checkpoint_label,
+                    "completed_episodes": completed,
+                    "successes": successes,
+                    "success_rate": successes / completed if completed else 0.0,
+                },
+                sync=True,
+            )
+    except BaseException as exc:
+        if run_logger is not None:
+            run_logger.write(
+                {
+                    "event": "run_error",
+                    "checkpoint": args.checkpoint_label,
+                    "completed_episodes": completed,
+                    "successes": successes,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                sync=True,
+            )
+        raise
     finally:
-        env.close()
+        if env is not None:
+            env.close()
+        if run_logger is not None:
+            run_logger.close()
         simulation_app.close()
 
 

@@ -21,7 +21,7 @@ exist on the task cfg.
 from isaaclab.envs.mimic_env_cfg import MimicEnvCfg, SubTaskConfig
 from isaaclab.utils import configclass
 
-from .so101_chess_cfg import GRIPPER_OPEN_LIMIT, So101ChessTaskCfg
+from .so101_chess_cfg import So101ChessTaskCfg
 
 
 @configclass
@@ -31,17 +31,34 @@ class So101ChessMimicEnvCfg(So101ChessTaskCfg, MimicEnvCfg):
     # Optional fixed calibration in the robot-root frame. This is never
     # inferred from a trajectory minimum.
     pickup_tcp_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    pickup_open_gripper_action: float = GRIPPER_OPEN_LIMIT
+
+    # Generated pickup waypoints may never command the TCP below this height
+    # above the live piece base. Higher demonstrated waypoints are untouched.
+    pickup_min_tcp_clearance: float = 0.024
+
+    # Pickup-only exclusions for the 120-episode balanced low-poly source.
+    # Pair each HDF5 demo index with its expected type so another dataset cannot
+    # silently apply these IDs to different piece geometries.
+    pickup_excluded_sources: tuple[tuple[int, str], ...] = (
+        (10, "queen"),
+        (13, "rook"),
+        (32, "knight"),
+        (43, "rook"),
+        (56, "knight"),
+        (110, "knight"),
+    )
 
     def __post_init__(self):
         # Run both parents' post-inits first so all task scaffolding (scene,
         # actions, observations, eef_names → recorders) is in place.
         super().__post_init__()
+        if self.pickup_min_tcp_clearance < 0.0:
+            raise ValueError("pickup_min_tcp_clearance must be nonnegative")
 
-        # Mimic generation should independently randomize every trial. The
-        # annotated-demo recorder overrides these values back to success-gated
-        # Sobol sampling so discarded human attempts can retry the same move.
-        self.events.reset_sobol_chess_move.params["sampling_strategy"] = "random"
+        # Cycle successful outputs uniformly through the available piece
+        # geometries while drawing a fresh random legal move after every failed
+        # attempt. The annotated recorder overrides this with Sobol sampling.
+        self.events.reset_sobol_chess_move.params["sampling_strategy"] = "type_balanced_random"
         self.events.reset_sobol_chess_move.params["advance_on_success_only"] = False
 
         # Keep the task's standard annotated recorder and make its dataset
@@ -117,7 +134,7 @@ class So101ChessMimicEnvCfg(So101ChessTaskCfg, MimicEnvCfg):
                     "eef_rotation_weight": 0.05,
                     "joint_position_weight": 0.02,
                     "knight_yaw_weight": 0.1,
-                    "nn_k": 3,
+                    "nn_k": 1,
                 },
                 action_noise=0.0,
                 num_interpolation_steps=5,
@@ -133,7 +150,7 @@ class So101ChessMimicEnvCfg(So101ChessTaskCfg, MimicEnvCfg):
                 subtask_term_signal="grasp",
                 subtask_term_offset_range=(0, 0),
                 selection_strategy="chess_latched_pickup",
-                selection_strategy_kwargs={},
+                selection_strategy_kwargs={"nn_k": 1},
                 action_noise=0.0,
                 num_interpolation_steps=1,
                 max_interpolation_translation_step=0.005,
@@ -160,7 +177,7 @@ class So101ChessMimicEnvCfg(So101ChessTaskCfg, MimicEnvCfg):
                 object_ref="destination_square",
                 subtask_term_signal="move_over_destination",
                 subtask_term_offset_range=(0, 5),
-                selection_strategy="nearest_neighbor_multi_object",
+                selection_strategy="chess_type_filtered_multi_object",
                 selection_strategy_kwargs={
                     "object_names": ["active_piece", "destination_square"],
                     "object_weights": {"active_piece": 1.0, "destination_square": 1.0},
@@ -181,14 +198,14 @@ class So101ChessMimicEnvCfg(So101ChessTaskCfg, MimicEnvCfg):
                 object_ref="destination_square",
                 subtask_term_signal="place_object",
                 subtask_term_offset_range=(0, 0),
-                selection_strategy="nearest_neighbor_multi_object",
+                selection_strategy="chess_type_filtered_multi_object",
                 selection_strategy_kwargs={
                     "object_names": ["active_piece", "destination_square"],
                     "object_weights": {"active_piece": 1.0, "destination_square": 1.0},
                     "pos_weight": 1.0,
                     "rot_weight": 0.0,
                     "aggregation": "max",
-                    "nn_k": 3,
+                    "nn_k": 1,
                 },
                 action_noise=0.0,
                 num_interpolation_steps=5,

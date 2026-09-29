@@ -1,0 +1,15 @@
+{
+  "state_sources": {
+    "observation.state": "obs/articulations/robot/joint_position"
+  },
+  "action_sources": {
+    "action": "actions/joints"
+  },
+  "video_sources": {
+    "observation.images.top_camera": "obs/cameras/top_camera",
+    "observation.images.right_wrist_camera": "obs/cameras/right_wrist_camera"
+  },
+  "tasks": {
+    "default": "Move the chess piece from the red square to the green square"
+  }
+}

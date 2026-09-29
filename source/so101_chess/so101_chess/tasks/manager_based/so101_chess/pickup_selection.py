@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 
 import isaaclab.utils.math as PoseUtils
-from isaaclab_mimic.datagen.selection_strategy import SelectionStrategy
+from isaaclab_mimic.datagen.selection_strategy import NearestNeighborMultiObjectStrategy, SelectionStrategy
 
 from .piece_types import normalize_piece_type
 
@@ -26,6 +26,45 @@ def _rotation_distance(source_rotations: torch.Tensor, current_rotation: torch.T
     delta = source_rotations @ current_rotation.transpose(-1, -2)
     cosine = (torch.diagonal(delta, dim1=-2, dim2=-1).sum(dim=-1) - 1.0) / 2.0
     return torch.acos(torch.clamp(cosine, -1.0, 1.0))
+
+
+def _type_filtered_candidate_indices(
+    *,
+    current_piece_type: str,
+    source_piece_types: list[str],
+    source_count: int,
+    excluded_demo_indices: list[int] | tuple[int, ...] | set[int] | None = None,
+) -> list[int]:
+    """Return source indices matching one normalized geometry type."""
+    if len(source_piece_types) != source_count:
+        raise ValueError("source_piece_types must align with the source demonstration pool")
+
+    excluded = {int(index) for index in (excluded_demo_indices or ())}
+    invalid = sorted(index for index in excluded if index < 0 or index >= source_count)
+    if invalid:
+        raise IndexError(
+            f"Excluded source demonstration indices are outside the {source_count}-episode pool: {invalid}"
+        )
+
+    normalized_type = normalize_piece_type(current_piece_type)
+    candidate_indices = [
+        index
+        for index, piece_type in enumerate(source_piece_types)
+        if normalize_piece_type(piece_type) == normalized_type and index not in excluded
+    ]
+    if not candidate_indices:
+        available = sorted(
+            {
+                normalize_piece_type(piece_type)
+                for index, piece_type in enumerate(source_piece_types)
+                if index not in excluded
+            }
+        )
+        raise ValueError(
+            f"No usable source demonstration has piece_type={normalized_type!r}; "
+            f"available types after exclusions: {available}"
+        )
+    return candidate_indices
 
 
 class TypeFilteredPickupStrategy(SelectionStrategy):
@@ -48,6 +87,7 @@ class TypeFilteredPickupStrategy(SelectionStrategy):
         eef_rotation_weight=0.05,
         joint_position_weight=0.02,
         knight_yaw_weight=0.1,
+        excluded_demo_indices=None,
         nn_k=3,
         **kwargs,
     ):
@@ -59,22 +99,16 @@ class TypeFilteredPickupStrategy(SelectionStrategy):
             raise ValueError("chess_type_filtered_pickup requires current and source piece types")
         if current_joint_positions is None or source_joint_positions is None:
             raise ValueError("chess_type_filtered_pickup requires current and source robot joint positions")
-        if len(source_piece_types) != len(src_subtask_datagen_infos):
-            raise ValueError("source_piece_types must align with the source demonstration pool")
         if len(source_joint_positions) != len(src_subtask_datagen_infos):
             raise ValueError("source_joint_positions must align with the source demonstration pool")
 
         normalized_type = normalize_piece_type(current_piece_type)
-        candidate_indices = [
-            index
-            for index, piece_type in enumerate(source_piece_types)
-            if normalize_piece_type(piece_type) == normalized_type
-        ]
-        if not candidate_indices:
-            available = sorted({normalize_piece_type(piece_type) for piece_type in source_piece_types})
-            raise ValueError(
-                f"No source demonstration has piece_type={normalized_type!r}; available types: {available}"
-            )
+        candidate_indices = _type_filtered_candidate_indices(
+            current_piece_type=normalized_type,
+            source_piece_types=source_piece_types,
+            source_count=len(src_subtask_datagen_infos),
+            excluded_demo_indices=excluded_demo_indices,
+        )
 
         device = eef_pose.device
         source_object_poses = torch.stack(
@@ -110,6 +144,45 @@ class TypeFilteredPickupStrategy(SelectionStrategy):
         ordered_local_indices = torch.argsort(score)[:top_k]
         chosen_local_index = int(ordered_local_indices[torch.randint(0, top_k, (1,), device=device)].item())
         return int(candidate_indices[chosen_local_index])
+
+
+class TypeFilteredMultiObjectStrategy(NearestNeighborMultiObjectStrategy):
+    """Run multi-object nearest-neighbor selection within the active piece type."""
+
+    NAME = "chess_type_filtered_multi_object"
+
+    def select_source_demo(
+        self,
+        eef_pose,
+        object_pose,
+        src_subtask_datagen_infos,
+        current_piece_type=None,
+        source_piece_types=None,
+        src_all_object_poses=None,
+        **kwargs,
+    ):
+        if current_piece_type is None or source_piece_types is None:
+            raise ValueError(
+                "chess_type_filtered_multi_object requires current and source piece types"
+            )
+        if src_all_object_poses is None:
+            raise ValueError(
+                "chess_type_filtered_multi_object requires source poses for every compared object"
+            )
+
+        candidate_indices = _type_filtered_candidate_indices(
+            current_piece_type=current_piece_type,
+            source_piece_types=source_piece_types,
+            source_count=len(src_subtask_datagen_infos),
+        )
+        selected_local_index = super().select_source_demo(
+            eef_pose=eef_pose,
+            object_pose=object_pose,
+            src_subtask_datagen_infos=[src_subtask_datagen_infos[index] for index in candidate_indices],
+            src_all_object_poses=[src_all_object_poses[index] for index in candidate_indices],
+            **kwargs,
+        )
+        return int(candidate_indices[int(selected_local_index)])
 
 
 class LatchedPickupStrategy(SelectionStrategy):

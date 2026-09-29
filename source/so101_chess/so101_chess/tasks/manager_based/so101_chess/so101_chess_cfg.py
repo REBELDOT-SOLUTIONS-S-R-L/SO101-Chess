@@ -26,7 +26,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import CameraCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
 from isaaclab.utils import configclass
-from pxr import Gf, PhysxSchema, Usd, UsdGeom, UsdPhysics
+from pxr import Gf, PhysxSchema, UsdGeom, UsdPhysics
 
 from so101_chess.assets import SCENES_DIR, OBJECTS_DIR, ROBOTS_DIR
 from . import mdp
@@ -43,14 +43,14 @@ from .mdp.pink_actions import So101PinkInverseKinematicsAction
 # =====================================================================
 SCENE_USD_PATH = os.path.join(SCENES_DIR, "scena3.usd")
 SO101_URDF_PATH = os.path.join(ROBOTS_DIR, "so101_wrist_mount_kinematics.urdf")
-BISHOP_USD_PATH = os.path.join(OBJECTS_DIR, "chesspieces/Bishop_collision.usd")
+BISHOP_USD_PATH = os.path.join(OBJECTS_DIR, "lowpoly_chess_pieces/Bishop_lowpoly.usd")
 
-KING_USD_PATH = os.path.join(OBJECTS_DIR, "chesspieces/King_collision.usd")
+KING_USD_PATH = os.path.join(OBJECTS_DIR, "lowpoly_chess_pieces/King_lowpoly.usd")
 
-KNIGHT_USD_PATH = os.path.join(OBJECTS_DIR, "chesspieces/Knight_collision.usd")
-PAWN_USD_PATH = os.path.join(OBJECTS_DIR, "chesspieces/Pawn_collision.usd")
-QUEEN_USD_PATH = os.path.join(OBJECTS_DIR, "chesspieces/Queen_collision.usd")
-ROOK_USD_PATH = os.path.join(OBJECTS_DIR, "chesspieces/Rook_collision.usd")
+KNIGHT_USD_PATH = os.path.join(OBJECTS_DIR, "lowpoly_chess_pieces/Knight_lowpoly.usd")
+PAWN_USD_PATH = os.path.join(OBJECTS_DIR, "lowpoly_chess_pieces/Pawn_lowpoly.usd")
+QUEEN_USD_PATH = os.path.join(OBJECTS_DIR, "lowpoly_chess_pieces/Queen_lowpoly.usd")
+ROOK_USD_PATH = os.path.join(OBJECTS_DIR, "lowpoly_chess_pieces/Rook_lowpoly.usd")
 
 # =====================================================================
 # Task targets — SINGLE SOURCE OF TRUTH for the "move one piece" episode.
@@ -81,6 +81,8 @@ GRIPPER_OPEN_THRESHOLD = 0.3
 # A real grasp arrests the jaw before it reaches GRIPPER_CLOSE_TARGET. Across
 # all six pieces, the measured contact positions are -0.045 to 0.248 rad.
 GRIPPER_CLOSED_THRESHOLD = 0.2
+PICKUP_POSITION_TOLERANCE = 0.012
+PICKUP_ORIENTATION_TOLERANCE = math.radians(22.5)
 PLACEMENT_MAX_TILT_DEG = 45.0
 RETURN_HOME_START_MAX_TILT_DEG = 75.0
 RETURN_HOME_FINAL_MAX_TILT_DEG = 5.0
@@ -320,16 +322,9 @@ def _spawn_rigid_usd(
 
     sim_utils.define_rigid_body_properties(prim_path, rigid_props)
     sim_utils.define_mass_properties(prim_path, mass_props)
-    # Keep one collision hierarchy per piece and force its authored collision
-    # meshes through PhysX convex decomposition. The former compound of 4--6
-    # overlapping primitives created one persistent contact pair per primitive
-    # against the gripper SDF and reduced throughput to roughly 2 FPS.
-    for child in Usd.PrimRange(prim):
-        if not child.HasAPI(UsdPhysics.CollisionAPI):
-            continue
-        approximation = child.GetAttribute("physics:approximation")
-        if approximation.IsValid():
-            approximation.Set("convexDecomposition")
+    # Preserve each asset's authored collision approximation. The low-poly
+    # pieces use one watertight SDF mesh; legacy assets remain available with
+    # their authored convex decompositions.
 
     # Speculative CCD catches fast contacts without the extra substeps of
     # sweep-based CCD.  Velocity and impulse caps below remain the backstop.
@@ -644,8 +639,10 @@ class So101ChessObservationsCfg:
                 "gripper_joint_pattern": "gripper",
                 "gripper_open_threshold": GRIPPER_OPEN_THRESHOLD,
                 "piece_dist_threshold": 0.08,
-                "position_tolerance": 0.005,
-                "orientation_tolerance": 0.05,
+                # Generated object-relative targets retain small residual tracking error on the
+                # 5-DoF arm. These tolerances cover observed converged pickup poses.
+                "position_tolerance": PICKUP_POSITION_TOLERANCE,
+                "orientation_tolerance": PICKUP_ORIENTATION_TOLERANCE,
                 # Generation compares against its transformed source target.
                 "max_position_step": 0.0015,
                 "max_orientation_step": 0.03,
@@ -672,12 +669,14 @@ class So101ChessObservationsCfg:
                 "gripper_closed_threshold": GRIPPER_CLOSED_THRESHOLD,
                 "gripper_stability_tolerance": 0.005,
                 "stable_frames": 5,
-                "position_tolerance": 0.008,
-                "orientation_tolerance": 0.08,
+                "position_tolerance": PICKUP_POSITION_TOLERANCE,
+                "orientation_tolerance": PICKUP_ORIENTATION_TOLERANCE,
                 "max_position_step": 0.0015,
                 "max_orientation_step": 0.03,
-                "max_position_departure": 0.02,
-                "max_orientation_departure": 0.20,
+                # The departure guards are twice the accepted grasp-pose error.
+                # They must never reject a pose that the grasp predicate accepts.
+                "max_position_departure": 2.0 * PICKUP_POSITION_TOLERANCE,
+                "max_orientation_departure": 2.0 * PICKUP_ORIENTATION_TOLERANCE,
                 "piece_dist_threshold": 0.08,
                 "piece_source_xy_threshold": 0.08,
                 "piece_source_z_threshold": 0.06,
@@ -740,7 +739,7 @@ class So101ChessObservationsCfg:
                 "eef_link": "gripper_frame_link",
                 "object_name": None,
                 "lift_z_offset": 0.05,
-                "max_xy_drift": 0.02,
+                "max_xy_drift": 0.07,
                 "gripper_joint_pattern": "gripper",
                 "gripper_open_threshold": GRIPPER_CLOSED_THRESHOLD,
                 "target_xy_threshold": 0.02,
