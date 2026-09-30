@@ -21,7 +21,7 @@ from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
 
 
 DEFAULT_CHECKPOINT = Path(
-    "/home/roboticslab/finetuned-models/xvla-chess-balanced-lowpoly-2-lr1e-4/checkpoints/120000/pretrained_model"
+    "/home/roboticslab/finetuned-models/xvla-chess-lowpoly-240k/checkpoints/240000/pretrained_model"
 )
 
 
