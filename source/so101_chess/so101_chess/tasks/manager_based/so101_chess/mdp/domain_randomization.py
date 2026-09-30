@@ -3,9 +3,11 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Reset-time visual randomization for the SO-101 chess scene.
+"""Reset-time domain randomization for the SO-101 chess scene.
 
-Only display materials are rebound. Contact and physics materials are left
+Camera poses are sampled around their configured pose on every reset, never
+around their previous pose. This keeps the perturbation bounded over arbitrarily
+long runs. Display-material randomization leaves contact and physics materials
 untouched. One set of materials is created per environment to avoid shared USD
 shader inputs making every clone change appearance at once.
 """
@@ -14,6 +16,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import isaaclab.sim as sim_utils
+import isaaclab.utils.math as math_utils
 import torch
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdShade
 
@@ -45,9 +49,292 @@ _PIECE_NAMES = (
     "pawn_black", "rook_black", "knight_black", "bishop_black", "queen_black", "king_black",
 )
 
+_POSITION_AXES = ("x", "y", "z")
+_ROTATION_AXES = ("roll", "pitch", "yaw")
+
+
+def _validate_axis_ranges(
+    ranges: dict[str, tuple[float, float]],
+    allowed_axes: tuple[str, ...],
+    label: str,
+) -> None:
+    unknown_axes = set(ranges) - set(allowed_axes)
+    if unknown_axes:
+        raise ValueError(f"{label} contains unsupported axes: {sorted(unknown_axes)}")
+    for axis, bounds in ranges.items():
+        if len(bounds) != 2 or bounds[0] > bounds[1]:
+            raise ValueError(f"{label}[{axis!r}] must be an increasing (min, max) pair")
+
+
+def _resolve_env_ids(env, env_ids) -> torch.Tensor:
+    if env_ids is None:
+        return torch.arange(env.num_envs, dtype=torch.long, device=env.device)
+    if isinstance(env_ids, slice):
+        return torch.arange(env.num_envs, dtype=torch.long, device=env.device)[env_ids]
+    return torch.as_tensor(env_ids, dtype=torch.long, device=env.device).flatten()
+
+
+def _sample_axis_offsets(
+    count: int,
+    ranges: dict[str, tuple[float, float]],
+    axes: tuple[str, ...],
+    device: str | torch.device,
+) -> torch.Tensor:
+    bounds = torch.tensor(
+        [ranges.get(axis, (0.0, 0.0)) for axis in axes],
+        dtype=torch.float32,
+        device=device,
+    )
+    return math_utils.sample_uniform(
+        bounds[:, 0],
+        bounds[:, 1],
+        (count, len(axes)),
+        device=device,
+    )
+
+
+def randomize_fixed_camera_pose(
+    env: ManagerBasedRLEnv,
+    env_ids,
+    camera_name: str = "top_camera",
+    position_range: dict[str, tuple[float, float]] | None = None,
+    rotation_range: dict[str, tuple[float, float]] | None = None,
+) -> None:
+    """Randomize a fixed camera around its configured nominal pose.
+
+    The configured ``CameraCfg.offset`` remains the immutable reference pose.
+    Reset samples are added to that pose rather than the camera's current pose,
+    preventing cumulative random-walk drift across episodes. Rotation offsets
+    are applied in the camera's local frame.
+    """
+    position_range = position_range or {}
+    rotation_range = rotation_range or {}
+    _validate_axis_ranges(position_range, _POSITION_AXES, "position_range")
+    _validate_axis_ranges(rotation_range, _ROTATION_AXES, "rotation_range")
+    # Annotated-recording launchers may intentionally remove camera configs.
+    if camera_name not in env.scene.keys():
+        return
+
+    env_ids = _resolve_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
+
+    camera = env.scene[camera_name]
+    camera_env_ids = env_ids.to(device=camera.device)
+    env_origins = env.scene.env_origins[camera_env_ids].to(device=camera.device)
+    count = len(camera_env_ids)
+
+    nominal_position = torch.tensor(
+        camera.cfg.offset.pos,
+        dtype=env_origins.dtype,
+        device=camera.device,
+    ).expand(count, -1)
+    nominal_orientation = torch.tensor(
+        camera.cfg.offset.rot,
+        dtype=env_origins.dtype,
+        device=camera.device,
+    ).expand(count, -1)
+
+    position_offsets = _sample_axis_offsets(
+        count, position_range, _POSITION_AXES, camera.device
+    ).to(dtype=env_origins.dtype)
+    rotation_offsets = _sample_axis_offsets(
+        count, rotation_range, _ROTATION_AXES, camera.device
+    ).to(dtype=env_origins.dtype)
+
+    positions = env_origins + nominal_position + position_offsets
+    orientation_offsets = math_utils.quat_from_euler_xyz(
+        rotation_offsets[:, 0],
+        rotation_offsets[:, 1],
+        rotation_offsets[:, 2],
+    )
+    orientations = math_utils.quat_mul(nominal_orientation, orientation_offsets)
+
+    camera.set_world_poses(
+        positions=positions,
+        orientations=orientations,
+        env_ids=camera_env_ids,
+        convention=camera.cfg.offset.convention,
+    )
+    # Refresh the sensor pose buffers after changing the underlying prims.
+    camera.reset(camera_env_ids)
+
 
 def _uniform(low: float, high: float) -> float:
     return low + (high - low) * float(torch.rand(()).item())
+
+
+def _sample_enabled_lights(count: int, off_probability: float, min_active_lights: int) -> torch.Tensor:
+    """Sample independent light availability while retaining a minimum count."""
+    enabled = torch.rand(count) >= off_probability
+    active_count = int(enabled.sum().item())
+    if active_count < min_active_lights:
+        disabled_indices = torch.where(~enabled)[0]
+        selected = disabled_indices[torch.randperm(len(disabled_indices))[: min_active_lights - active_count]]
+        enabled[selected] = True
+    return enabled
+
+
+def _enforce_minimum_height(
+    position: tuple[float, float, float],
+    minimum_height_m: float | None,
+) -> tuple[float, float, float]:
+    """Keep a sampled light above the configured scene-local height."""
+    if minimum_height_m is None:
+        return position
+    return (position[0], position[1], max(position[2], minimum_height_m))
+
+
+def _nominal_light_pose(env, path: str, prim: Usd.Prim):
+    """Return and cache a light's authored local pose in ``(w, x, y, z)`` form."""
+    pose_defaults = getattr(env, "_chess_light_pose_defaults", None)
+    if pose_defaults is None:
+        pose_defaults = {}
+        env._chess_light_pose_defaults = pose_defaults
+    if path not in pose_defaults:
+        transform = Gf.Transform(UsdGeom.Xformable(prim).GetLocalTransformation())
+        translation = transform.GetTranslation()
+        quaternion = transform.GetRotation().GetQuat()
+        imaginary = quaternion.GetImaginary()
+        pose_defaults[path] = (
+            tuple(float(value) for value in translation),
+            (float(quaternion.GetReal()), *(float(value) for value in imaginary)),
+        )
+    return pose_defaults[path]
+
+
+def randomize_scene_lights(
+    env: ManagerBasedRLEnv,
+    env_ids,
+    position_range: dict[str, tuple[float, float]] | None = None,
+    rotation_range: dict[str, tuple[float, float]] | None = None,
+    intensity_range: tuple[float, float] = (0.2, 2.0),
+    temperature_range: tuple[float, float] = (2500.0, 9000.0),
+    off_probability: float = 0.15,
+    min_active_lights: int = 1,
+    minimum_height_m: float | None = None,
+) -> None:
+    """Randomize every authored task light without removing any light prim.
+
+    Position and rotation samples are offsets from the immutable authored local
+    pose, so repeated resets cannot produce a random walk. Each light gets an
+    independent intensity multiplier and can be disabled by setting its
+    intensity to zero. At least ``min_active_lights`` remain illuminated.
+    """
+    position_range = position_range or {}
+    rotation_range = rotation_range or {}
+    _validate_axis_ranges(position_range, _POSITION_AXES, "position_range")
+    _validate_axis_ranges(rotation_range, _ROTATION_AXES, "rotation_range")
+    if intensity_range[0] <= 0 or intensity_range[0] > intensity_range[1]:
+        raise ValueError("intensity_range must be positive and increasing")
+    if temperature_range[0] <= 0 or temperature_range[0] > temperature_range[1]:
+        raise ValueError("temperature_range must be positive and increasing")
+    if not 0.0 <= off_probability <= 1.0:
+        raise ValueError("off_probability must be between 0 and 1")
+    if not 1 <= min_active_lights <= len(_LIGHT_NAMES):
+        raise ValueError(f"min_active_lights must be between 1 and {len(_LIGHT_NAMES)}")
+
+    env_ids = _resolve_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
+
+    stage = env.sim.stage
+    light_defaults = getattr(env, "_chess_light_defaults", None)
+    if light_defaults is None:
+        light_defaults = {}
+        env._chess_light_defaults = light_defaults
+
+    for env_id in env_ids.cpu().tolist():
+        scene_path = f"/World/envs/env_{env_id}/Scene"
+
+        # The imported defaultGroundPlane contains a 100000-intensity sphere
+        # light. Keep its prim but disable it so the task lights remain visible.
+        ground_light = stage.GetPrimAtPath(f"{scene_path}/defaultGroundPlane/SphereLight")
+        if ground_light.IsValid():
+            UsdLux.LightAPI(ground_light).GetIntensityAttr().Set(0.0)
+
+        light_count = len(_LIGHT_NAMES)
+        position_offsets = _sample_axis_offsets(
+            light_count, position_range, _POSITION_AXES, "cpu"
+        )
+        rotation_offsets = _sample_axis_offsets(
+            light_count, rotation_range, _ROTATION_AXES, "cpu"
+        )
+        orientation_offsets = math_utils.quat_from_euler_xyz(
+            rotation_offsets[:, 0],
+            rotation_offsets[:, 1],
+            rotation_offsets[:, 2],
+        )
+        enabled_lights = _sample_enabled_lights(
+            light_count, off_probability, min_active_lights
+        )
+        temperature = _uniform(*temperature_range)
+        sampled_intensities = {}
+        sampled_multipliers = {}
+        sampled_positions = {}
+        sampled_orientations = {}
+
+        for index, name in enumerate(_LIGHT_NAMES):
+            path = f"{scene_path}/{name}"
+            prim = stage.GetPrimAtPath(path)
+            if not prim.IsValid():
+                raise RuntimeError(f"Chess scene light is missing: {path}")
+
+            light = UsdLux.LightAPI(prim)
+            intensity = light.GetIntensityAttr()
+            if path not in light_defaults:
+                light_defaults[path] = float(intensity.Get())
+            multiplier = _uniform(*intensity_range)
+            sampled_intensity = light_defaults[path] * multiplier if enabled_lights[index] else 0.0
+            intensity.Set(sampled_intensity)
+            light.GetEnableColorTemperatureAttr().Set(True)
+            light.GetColorTemperatureAttr().Set(temperature)
+
+            nominal_position, nominal_orientation = _nominal_light_pose(env, path, prim)
+            sampled_position = tuple(
+                nominal_position[axis] + float(position_offsets[index, axis].item())
+                for axis in range(3)
+            )
+            sampled_position = _enforce_minimum_height(
+                sampled_position, minimum_height_m
+            )
+            nominal_orientation_tensor = torch.tensor(
+                nominal_orientation, dtype=orientation_offsets.dtype
+            ).unsqueeze(0)
+            sampled_orientation = math_utils.quat_mul(
+                nominal_orientation_tensor, orientation_offsets[index].unsqueeze(0)
+            )[0]
+            sampled_orientation_tuple = tuple(float(value.item()) for value in sampled_orientation)
+            sim_utils.standardize_xform_ops(
+                prim,
+                translation=sampled_position,
+                orientation=sampled_orientation_tuple,
+            )
+
+            sampled_intensities[name] = sampled_intensity
+            sampled_multipliers[name] = multiplier
+            sampled_positions[name] = sampled_position
+            sampled_orientations[name] = sampled_orientation_tuple
+
+        if not hasattr(env, "chess_randomization_state"):
+            env.chess_randomization_state = {}
+        state = env.chess_randomization_state.setdefault(env_id, {})
+        state.update(
+            {
+                "light_temperature_k": temperature,
+                "light_intensities": sampled_intensities,
+                "light_intensity_multipliers": sampled_multipliers,
+                "light_positions": sampled_positions,
+                "light_orientations_wxyz": sampled_orientations,
+                "active_lights": [
+                    name for index, name in enumerate(_LIGHT_NAMES) if enabled_lights[index]
+                ],
+            }
+        )
+        print(
+            f"[CHESS DR] env={env_id} active_lights={state['active_lights']} "
+            f"light_intensities={sampled_intensities} temperature_k={temperature:.0f}"
+        )
 
 
 def _preview_material(
@@ -167,73 +454,41 @@ def randomize_chess_appearance(
     env_ids,
     light_intensity_range: tuple[float, float] = (0.2, 2.0),
     light_temperature_range: tuple[float, float] = (2500.0, 9000.0),
+    light_position_range: dict[str, tuple[float, float]] | None = None,
+    light_rotation_range: dict[str, tuple[float, float]] | None = None,
+    light_off_probability: float = 0.15,
+    min_active_lights: int = 1,
+    light_minimum_height_m: float | None = None,
 ) -> None:
     """Vary lights, table, robot, pieces and board on each reset.
 
-    All three lights share one sampled temperature and intensity multiplier
-    so the effect remains visible in a camera image. The red source and green
-    target markers and yellow board border keep their authored materials.
+    Lights retain their authored prims and independently vary pose and
+    intensity; a bounded subset may have zero intensity. The red source and
+    green target markers and yellow board border keep their authored materials.
     Piece colors stay on their named side with one printed-plastic family.
     """
-    if light_intensity_range[0] <= 0 or light_intensity_range[0] > light_intensity_range[1]:
-        raise ValueError("light_intensity_range must be positive and increasing")
-    if light_temperature_range[0] <= 0 or light_temperature_range[0] > light_temperature_range[1]:
-        raise ValueError("light_temperature_range must be positive and increasing")
-    if env_ids is None:
-        env_ids = torch.arange(env.num_envs, device=env.device)
-    elif isinstance(env_ids, slice):
-        env_ids = torch.arange(env.num_envs, device=env.device)[env_ids]
-    else:
-        env_ids = torch.as_tensor(env_ids, device=env.device)
+    env_ids = _resolve_env_ids(env, env_ids)
     if env_ids.numel() == 0:
         return
 
+    randomize_scene_lights(
+        env,
+        env_ids,
+        position_range=light_position_range,
+        rotation_range=light_rotation_range,
+        intensity_range=light_intensity_range,
+        temperature_range=light_temperature_range,
+        off_probability=light_off_probability,
+        min_active_lights=min_active_lights,
+        minimum_height_m=light_minimum_height_m,
+    )
+
     stage = env.sim.stage
-    light_defaults = getattr(env, "_chess_light_defaults", None)
-    if light_defaults is None:
-        light_defaults = {}
-        env._chess_light_defaults = light_defaults
 
     for env_id in env_ids.cpu().tolist():
         scene_path = f"/World/envs/env_{env_id}/Scene"
         looks = f"{scene_path}/DomainRandomizationLooks"
         UsdGeom.Scope.Define(stage, looks)
-
-        # The imported defaultGroundPlane contains a 100000-intensity sphere
-        # light. It overwhelms the three authored task lights, making changes
-        # to their intensity and temperature nearly invisible in camera images.
-        ground_light = stage.GetPrimAtPath(f"{scene_path}/defaultGroundPlane/SphereLight")
-        if ground_light.IsValid():
-            UsdLux.LightAPI(ground_light).GetIntensityAttr().Set(0.0)
-
-        brightness = _uniform(*light_intensity_range)
-        temperature = _uniform(*light_temperature_range)
-        sampled_lights = {}
-        for name in _LIGHT_NAMES:
-            path = f"{scene_path}/{name}"
-            prim = stage.GetPrimAtPath(path)
-            if not prim.IsValid():
-                raise RuntimeError(f"Chess scene light is missing: {path}")
-            light = UsdLux.LightAPI(prim)
-            intensity = light.GetIntensityAttr()
-            if path not in light_defaults:
-                light_defaults[path] = float(intensity.Get())
-            sampled_intensity = light_defaults[path] * brightness
-            intensity.Set(sampled_intensity)
-            light.GetEnableColorTemperatureAttr().Set(True)
-            light.GetColorTemperatureAttr().Set(temperature)
-            sampled_lights[name] = sampled_intensity
-        if not hasattr(env, "chess_randomization_state"):
-            env.chess_randomization_state = {}
-        env.chess_randomization_state[env_id] = {
-            "light_temperature_k": temperature,
-            "light_intensities": sampled_lights,
-            "light_brightness_multiplier": brightness,
-        }
-        print(
-            f"[CHESS DR] env={env_id} light_intensities={sampled_lights} "
-            f"temperature_k={temperature:.0f}"
-        )
 
         # Painted white MDF: one library texture family, with only slight
         # changes in shade, grain contrast and roughness between episodes.

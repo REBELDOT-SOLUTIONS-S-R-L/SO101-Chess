@@ -129,6 +129,20 @@ PIECE_SOLVER_VELOCITY_ITERATIONS = 1
 # increase squeeze/retention force without changing its response gains.
 GRIPPER_EFFORT_LIMIT = 20.0
 
+# Conservative pose randomization. Each reset samples from these bounds around
+# the configured nominal pose; samples never accumulate across episodes.
+TOP_CAMERA_POSITION_RANDOMIZATION_M = 0.005
+TOP_CAMERA_ROTATION_RANDOMIZATION_RAD = math.radians(0.5)
+ROBOT_XY_POSITION_RANDOMIZATION_M = 0.005
+# Room-scale light variation: fixtures may come from substantially different
+# horizontal locations and ceiling heights while remaining bounded per reset.
+LIGHT_XY_POSITION_RANDOMIZATION_M = 1.50
+LIGHT_Z_POSITION_RANDOMIZATION_M = 1.00
+LIGHT_ROTATION_RANDOMIZATION_RAD = math.radians(45.0)
+LIGHT_MINIMUM_HEIGHT_M = 0.90
+LIGHT_OFF_PROBABILITY = 0.15
+MIN_ACTIVE_LIGHTS = 1
+
 
 # The scene USD was authored with contact offsets and torsional-friction radii
 # that are larger than the chessboard itself. Override them before PhysX first
@@ -407,8 +421,8 @@ def attach_cameras(scene_cfg) -> None:
             clipping_range=(0.05, 10.0),
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(-0.2294,-0.05, 1.20),
-            rot=(0.6743, 0.212,-0.212 ,-0.6743),
+            pos=(-0.15,0.0, 1.20),
+            rot=(0.68277, 0.18308,-0.18295 ,-0.68325),
             convention="opengl",
         ),
     )
@@ -788,6 +802,39 @@ class So101ChessEventCfg:
         params={"asset_cfg": SceneEntityCfg("robot"), "reset_joint_targets": True},
     )
 
+    randomize_robot_position = EventTerm(
+        func=base_mdp.reset_root_state_uniform,
+        # Missing Z/rotation keys produce zero offsets from the configured
+        # default root pose, so only X and Y are randomized.
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "pose_range": {
+                "x": (-ROBOT_XY_POSITION_RANDOMIZATION_M, ROBOT_XY_POSITION_RANDOMIZATION_M),
+                "y": (-ROBOT_XY_POSITION_RANDOMIZATION_M, ROBOT_XY_POSITION_RANDOMIZATION_M),
+            },
+            "velocity_range": {},
+        },
+    )
+
+    randomize_top_camera_pose = EventTerm(
+        func=mdp.randomize_fixed_camera_pose,
+        mode="reset",
+        params={
+            "camera_name": "top_camera",
+            "position_range": {
+                "x": (-TOP_CAMERA_POSITION_RANDOMIZATION_M, TOP_CAMERA_POSITION_RANDOMIZATION_M),
+                "y": (-TOP_CAMERA_POSITION_RANDOMIZATION_M, TOP_CAMERA_POSITION_RANDOMIZATION_M),
+                "z": (-TOP_CAMERA_POSITION_RANDOMIZATION_M, TOP_CAMERA_POSITION_RANDOMIZATION_M),
+            },
+            "rotation_range": {
+                "roll": (-TOP_CAMERA_ROTATION_RANDOMIZATION_RAD, TOP_CAMERA_ROTATION_RANDOMIZATION_RAD),
+                "pitch": (-TOP_CAMERA_ROTATION_RANDOMIZATION_RAD, TOP_CAMERA_ROTATION_RANDOMIZATION_RAD),
+                "yaw": (-TOP_CAMERA_ROTATION_RANDOMIZATION_RAD, TOP_CAMERA_ROTATION_RANDOMIZATION_RAD),
+            },
+        },
+    )
+
     reset_sobol_chess_move = EventTerm(
         func=mdp.sample_chess_move_reset,
         mode="reset",
@@ -822,6 +869,19 @@ class So101ChessEventCfg:
         params={
             "light_intensity_range": (0.4, 2.0),
             "light_temperature_range": (2500.0, 7000.0),
+            "light_position_range": {
+                "x": (-LIGHT_XY_POSITION_RANDOMIZATION_M, LIGHT_XY_POSITION_RANDOMIZATION_M),
+                "y": (-LIGHT_XY_POSITION_RANDOMIZATION_M, LIGHT_XY_POSITION_RANDOMIZATION_M),
+                "z": (-LIGHT_Z_POSITION_RANDOMIZATION_M, LIGHT_Z_POSITION_RANDOMIZATION_M),
+            },
+            "light_rotation_range": {
+                "roll": (-LIGHT_ROTATION_RANDOMIZATION_RAD, LIGHT_ROTATION_RANDOMIZATION_RAD),
+                "pitch": (-LIGHT_ROTATION_RANDOMIZATION_RAD, LIGHT_ROTATION_RANDOMIZATION_RAD),
+                "yaw": (-LIGHT_ROTATION_RANDOMIZATION_RAD, LIGHT_ROTATION_RANDOMIZATION_RAD),
+            },
+            "light_off_probability": LIGHT_OFF_PROBABILITY,
+            "min_active_lights": MIN_ACTIVE_LIGHTS,
+            "light_minimum_height_m": LIGHT_MINIMUM_HEIGHT_M,
         },
     )
 
